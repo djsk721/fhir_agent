@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,8 @@ from .prompts import (
     MANAGER_SYSTEM_PROMPT,
     MAPPING_SYSTEM_PROMPT,
     MAPPING_USER_PROMPT_TEMPLATE,
+    SQL_PLANNER_SYSTEM_PROMPT,
+    SQL_PLANNER_USER_PROMPT_TEMPLATE,
     VERIFIER_SYSTEM_PROMPT,
     VERIFIER_USER_PROMPT_TEMPLATE,
 )
@@ -24,29 +27,46 @@ def _dump_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _iter_fenced_blocks(raw_text: str) -> list[str]:
+    return [
+        match.group("body").strip()
+        for match in re.finditer(
+            r"```(?:json|JSON)?\s*(?P<body>[\s\S]*?)```",
+            raw_text,
+        )
+    ]
+
+
+def _extract_first_complete_json(text: str) -> str | None:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            _, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        return text[index : index + end]
+    return None
+
+
 def _extract_json_block(raw_text: str) -> str:
     """LLM 응답에서 JSON 본문을 최대한 안전하게 추출합니다."""
 
     text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
+    fenced_blocks = _iter_fenced_blocks(text)
+    for block in fenced_blocks:
+        extracted = _extract_first_complete_json(block)
+        if extracted is not None:
+            return extracted
 
-    start_positions = [idx for idx in (text.find("{"), text.find("[")) if idx != -1]
-    if not start_positions:
-        return text
+    extracted = _extract_first_complete_json(text)
+    if extracted is not None:
+        return extracted
 
-    start = min(start_positions)
-    end_object = text.rfind("}")
-    end_array = text.rfind("]")
-    end = max(end_object, end_array)
-    if end == -1 or end < start:
-        return text[start:]
-    return text[start : end + 1]
+    if fenced_blocks:
+        return fenced_blocks[0]
+    return text
 
 
 def _load_json_response(raw_text: str) -> Any:
@@ -60,6 +80,15 @@ class VerificationResult:
     ok: bool
     errors: list[str]
     suggestions: list[str]
+
+
+@dataclass(frozen=True)
+class SqlPlanResult:
+    resource_type: str
+    rationale: str
+    tables: list[str]
+    sql: str
+    params: dict[str, Any]
 
 
 class BaseAgent:
@@ -89,9 +118,45 @@ class MappingAgent(BaseAgent):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, MAPPING_SYSTEM_PROMPT)
 
-    def run(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
-        prompt = MAPPING_USER_PROMPT_TEMPLATE.format(raw_json=_dump_json(raw_payload))
+    def run(
+        self,
+        raw_payload: dict[str, Any],
+        rag_context: str = "None",
+        sql_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        prompt = MAPPING_USER_PROMPT_TEMPLATE.format(
+            raw_json=_dump_json(raw_payload),
+            sql_evidence=_dump_json(sql_evidence or {}),
+            rag_context=rag_context,
+        )
         return _load_json_response(self._invoke(prompt))
+
+
+class SqlPlannerAgent(BaseAgent):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings, SQL_PLANNER_SYSTEM_PROMPT)
+
+    def run(
+        self,
+        resource_type: str,
+        seed_context: dict[str, Any],
+        sql_schema_context: str,
+        rag_context: str,
+    ) -> SqlPlanResult:
+        prompt = SQL_PLANNER_USER_PROMPT_TEMPLATE.format(
+            resource_type=resource_type,
+            seed_context=_dump_json(seed_context),
+            sql_schema_context=sql_schema_context,
+            rag_context=rag_context,
+        )
+        result = _load_json_response(self._invoke(prompt))
+        return SqlPlanResult(
+            resource_type=str(result.get("resource_type", resource_type)),
+            rationale=str(result.get("rationale", "")),
+            tables=[str(value) for value in result.get("tables", [])],
+            sql=str(result.get("sql", "")).strip(),
+            params=dict(result.get("params", {})),
+        )
 
 
 class FhirGeneratorAgent(BaseAgent):
@@ -106,9 +171,11 @@ class FhirGeneratorAgent(BaseAgent):
         resource_type: str,
         correction_instructions: str = "None",
         generated_resource_context: dict[str, Any] | None = None,
+        rag_context: str = "None",
     ) -> dict[str, Any]:
         prompt = FHIR_USER_PROMPT_TEMPLATE.format(
             mapping_json=_dump_json(mapping_payload),
+            rag_context=rag_context,
             resource_type=resource_type,
             generated_resource_context=_dump_json(generated_resource_context or {}),
             correction_instructions=correction_instructions,
@@ -122,9 +189,15 @@ class VerifierAgent(BaseAgent):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, VERIFIER_SYSTEM_PROMPT)
 
-    def run(self, fhir_payload: dict[str, Any], resource_type: str) -> VerificationResult:
+    def run(
+        self,
+        fhir_payload: dict[str, Any],
+        resource_type: str,
+        rag_context: str = "None",
+    ) -> VerificationResult:
         prompt = VERIFIER_USER_PROMPT_TEMPLATE.format(
             resource_type=resource_type,
+            rag_context=rag_context,
             fhir_json=_dump_json(fhir_payload),
         )
         result = _load_json_response(self._invoke(prompt))
@@ -161,5 +234,7 @@ class ManagerAgent(BaseAgent):
         result = _load_json_response(self._invoke(prompt))
         return {
             "action": str(result.get("action", "regenerate")),
-            "correction_instructions": str(result.get("correction_instructions", "")).strip(),
+            "correction_instructions": str(
+                result.get("correction_instructions", "")
+            ).strip(),
         }

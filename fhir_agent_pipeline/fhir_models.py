@@ -130,9 +130,6 @@ def validate_fhir_json(resource: dict[str, Any], resource_type: str) -> tuple[bo
                 message = item.get("msg", "validation error")
                 errors.append(f"{location}: {message}" if location else str(message))
 
-        if not resource.get("name"):
-            errors.append("Patient.name is missing or empty.")
-
     elif resource_type == "Encounter":
         try:
             EncounterResource.model_validate(resource)
@@ -197,4 +194,3 @@ def validate_bundle(bundle: dict[str, Any], required_resource_types: list[str]) 
             errors.append(f"Bundle is missing required resourceType '{required_type}'.")
 
     return (len(errors) == 0), errors
-

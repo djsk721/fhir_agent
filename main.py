@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
+from app.main import app as fastapi_app
 from fhir_agent_pipeline.config import load_settings
-from fhir_agent_pipeline.db import fetch_patient_demo_row
 from fhir_agent_pipeline.pipeline import MultiAgentFhirPipeline
+from fhir_agent_pipeline.retrieval import RuntimeRetriever
+from fhir_agent_pipeline.sql_runtime import SafeSqlRuntime
 
-def main() -> dict:
-    """DB 추출부터 Bundle 생성/검증까지 전체 파이프라인을 실행합니다."""
+
+app = fastapi_app
+
+
+def main() -> dict[str, Any]:
+    """Seed 기반 SQL 계획부터 Bundle 생성/검증까지 전체 파이프라인을 실행합니다."""
 
     settings = load_settings()
-    patient_demo_row = fetch_patient_demo_row(settings)
+    seed_payload: dict[str, Any] = {
+        "patient": {"subject_id": settings.patient_subject_id}
+        if settings.patient_subject_id is not None
+        else {},
+        "admission": None,
+        "lab_event": None,
+    }
 
-    pipeline = MultiAgentFhirPipeline(settings)
-    result = pipeline.run(patient_demo_row)
+    pipeline = MultiAgentFhirPipeline(
+        settings,
+        retriever=RuntimeRetriever(settings),
+        sql_runtime=SafeSqlRuntime(settings),
+    )
+    result = pipeline.run(seed_payload)
 
     if result.verification_errors:
         print(json.dumps(result.fhir_payload, ensure_ascii=False, indent=2))
@@ -26,4 +43,4 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    _ = main()

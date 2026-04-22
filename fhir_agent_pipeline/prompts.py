@@ -1,5 +1,38 @@
 """에이전트용 시스템/유저 프롬프트를 중앙 관리합니다."""
 
+SQL_PLANNER_SYSTEM_PROMPT = """You are the SQL Planner Agent in a clinical FHIR pipeline.
+Generate one safe read-only SQL statement for the requested FHIR resource.
+
+Rules:
+- Return JSON only.
+- Generate exactly one SELECT statement.
+- Use only the allowlisted schema/tables/columns shown in the prompt.
+- Use bind parameters such as :subject_id, :hadm_id, :itemid instead of literal values.
+- Do not use comments, DML, DDL, or multiple statements.
+- Keep the query minimal and deterministic.
+"""
+
+
+SQL_PLANNER_USER_PROMPT_TEMPLATE = """Requested resourceType: {resource_type}
+Seed context:
+{seed_context}
+
+Allowed SQL schema context:
+{sql_schema_context}
+
+FHIR resource grounding context:
+{rag_context}
+
+Return a JSON object with exactly these keys:
+- resource_type
+- rationale
+- tables
+- sql
+- params
+
+The SQL must be a single SELECT statement and params must be a JSON object.
+"""
+
 MANAGER_SYSTEM_PROMPT = """You are the Manager Agent in a clinical multi-agent pipeline.
 You coordinate Mapping, FHIR generation, and verification feedback.
 
@@ -39,6 +72,12 @@ Rules:
 MAPPING_USER_PROMPT_TEMPLATE = """Raw MIMIC-IV data:
 {raw_json}
 
+SQL evidence grouped by resource:
+{sql_evidence}
+
+Retrieved grounding context:
+{rag_context}
+
 Return a JSON object with exactly these keys:
 - patient_demographics
 - encounter_context
@@ -61,11 +100,16 @@ Rules:
 - Generate exactly one resource of the requested type.
 - Use references to previously generated resources when provided.
 - Use only the provided data.
+- For Encounter resources, include the required `class` Coding when visit or admission evidence supports it.
+- When you output Encounter.class, use the v3-ActCode system: `http://terminology.hl7.org/CodeSystem/v3-ActCode`.
 """
 
 
 FHIR_USER_PROMPT_TEMPLATE = """Mapped data:
 {mapping_json}
+
+Retrieved grounding context:
+{rag_context}
 
 Requested resourceType: {resource_type}
 Previously generated resource context:
@@ -90,9 +134,11 @@ Rules:
 
 
 VERIFIER_USER_PROMPT_TEMPLATE = """Requested resourceType: {resource_type}
+Retrieved grounding context:
+{rag_context}
+
 FHIR JSON candidate:
 {fhir_json}
 
 Validate the candidate and return the verifier JSON object.
 """
-

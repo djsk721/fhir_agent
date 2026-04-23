@@ -107,6 +107,15 @@ class BundleResource(BaseModel):
     entry: list[BundleEntry]
 
 
+def _format_validation_errors(exc: ValidationError) -> list[str]:
+    errors: list[str] = []
+    for item in exc.errors():
+        location = ".".join(str(part) for part in item.get("loc", []))
+        message = item.get("msg", "validation error")
+        errors.append(f"{location}: {message}" if location else str(message))
+    return errors
+
+
 def validate_fhir_json(resource: dict[str, Any], resource_type: str) -> tuple[bool, list[str]]:
     """FHIR JSON의 최소 구조와 필수 필드를 검증합니다."""
 
@@ -125,28 +134,19 @@ def validate_fhir_json(resource: dict[str, Any], resource_type: str) -> tuple[bo
         try:
             PatientResource.model_validate(resource)
         except ValidationError as exc:
-            for item in exc.errors():
-                location = ".".join(str(part) for part in item.get("loc", []))
-                message = item.get("msg", "validation error")
-                errors.append(f"{location}: {message}" if location else str(message))
+            errors.extend(_format_validation_errors(exc))
 
     elif resource_type == "Encounter":
         try:
             EncounterResource.model_validate(resource)
         except ValidationError as exc:
-            for item in exc.errors():
-                location = ".".join(str(part) for part in item.get("loc", []))
-                message = item.get("msg", "validation error")
-                errors.append(f"{location}: {message}" if location else str(message))
+            errors.extend(_format_validation_errors(exc))
 
     elif resource_type == "Observation":
         try:
             ObservationResource.model_validate(resource)
         except ValidationError as exc:
-            for item in exc.errors():
-                location = ".".join(str(part) for part in item.get("loc", []))
-                message = item.get("msg", "validation error")
-                errors.append(f"{location}: {message}" if location else str(message))
+            errors.extend(_format_validation_errors(exc))
 
     return (len(errors) == 0), errors
 
@@ -178,10 +178,7 @@ def validate_bundle(bundle: dict[str, Any], required_resource_types: list[str]) 
     try:
         BundleResource.model_validate(bundle)
     except ValidationError as exc:
-        for item in exc.errors():
-            location = ".".join(str(part) for part in item.get("loc", []))
-            message = item.get("msg", "validation error")
-            errors.append(f"{location}: {message}" if location else str(message))
+        errors.extend(_format_validation_errors(exc))
         return False, errors
 
     actual_types = [

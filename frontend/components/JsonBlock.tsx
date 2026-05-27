@@ -2,6 +2,8 @@ type JsonBlockProps = {
   title?: string;
   value: unknown;
   emptyMessage: string;
+  compact?: boolean;
+  headingLevel?: "h3" | "h4";
 };
 
 function formatValue(value: unknown): string {
@@ -16,17 +18,24 @@ function formatValue(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
-export function JsonBlock({ title, value, emptyMessage }: JsonBlockProps) {
+export function JsonBlock({
+  title,
+  value,
+  emptyMessage,
+  compact = false,
+  headingLevel = "h3",
+}: JsonBlockProps) {
   const content = formatValue(value);
+  const HeadingTag = headingLevel;
 
   return (
     <div className="json-section">
       {title ? (
         <div className="json-section-header">
-          <h3>{title}</h3>
+          <HeadingTag>{title}</HeadingTag>
         </div>
       ) : null}
-      <pre className="json-block">{content || emptyMessage}</pre>
+      <pre className={`json-block${compact ? " json-block--compact" : ""}`}>{content || emptyMessage}</pre>
     </div>
   );
 }

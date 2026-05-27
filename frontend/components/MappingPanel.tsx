@@ -1,4 +1,4 @@
-import type { MappingResponse } from "@/api";
+import type { MappingResponse } from "@/lib/api";
 import { JsonBlock } from "@/components/JsonBlock";
 import { Panel } from "@/components/Panel";
 

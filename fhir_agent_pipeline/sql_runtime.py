@@ -10,6 +10,11 @@ from sqlalchemy.engine import Engine
 
 from .config import Settings
 from .db import _normalize_scalar, build_engine
+from .payload_utils import extract_admissions
+
+
+class SubjectConsistencyError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,7 @@ class SqlQueryPlan:
     params: dict[str, Any]
     tables: list[str]
     rationale: str
+    expected_subject_id: int | str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,10 +68,22 @@ class SafeSqlRuntime:
     ) -> dict[str, Any]:
         patient = raw_payload.get("patient") or {}
         admission = raw_payload.get("admission") or {}
+        admissions = extract_admissions(raw_payload)
         lab_event = raw_payload.get("lab_event") or {}
+        hadm_ids = [
+            admission_row["hadm_id"]
+            for admission_row in admissions
+            if admission_row.get("hadm_id") is not None
+        ]
+        hadm_id = admission.get("hadm_id") or lab_event.get("hadm_id")
+        if hadm_id is None and len(hadm_ids) == 1:
+            hadm_id = hadm_ids[0]
+
         return {
             "subject_id": patient.get("subject_id"),
-            "hadm_id": admission.get("hadm_id") or lab_event.get("hadm_id"),
+            "hadm_id": hadm_id,
+            "hadm_ids": hadm_ids,
+            "admission_count": len(admissions),
             "itemid": lab_event.get("itemid"),
             "resource_type": resource_type,
         }
@@ -83,6 +101,22 @@ class SafeSqlRuntime:
             )
         return "\n".join(blocks)
 
+    def fetch_admissions_for_patient(self, subject_id: int | str | None) -> list[dict[str, Any]]:
+        if subject_id is None:
+            return []
+
+        sql = (
+            f"SELECT * FROM {self._settings.mimic_schema}.{self._settings.mimic_admissions_table} "
+            "WHERE subject_id = :subject_id "
+            "ORDER BY admittime NULLS LAST, hadm_id"
+        )
+        engine = self._get_engine()
+        df = pd.read_sql_query(text(sql), con=engine, params={"subject_id": subject_id})
+        return [
+            {str(key): _normalize_scalar(value) for key, value in record.items()}
+            for record in df.to_dict(orient="records")
+        ]
+
     def execute_plan(self, plan: SqlQueryPlan) -> SqlExecutionResult:
         validated_sql = self._validate_and_normalize_sql(plan)
         engine = self._get_engine()
@@ -91,6 +125,7 @@ class SafeSqlRuntime:
             {str(key): _normalize_scalar(value) for key, value in record.items()}
             for record in df.to_dict(orient="records")
         ]
+        rows, discarded_count = _filter_rows_by_subject_id(rows, plan.expected_subject_id)
         trace = [
             {
                 "type": "sql_plan",
@@ -103,6 +138,16 @@ class SafeSqlRuntime:
                 "detail": plan.rationale,
             }
         ]
+        if discarded_count > 0:
+            trace.append(
+                {
+                    "type": "sql_plan",
+                    "resource_type": plan.resource_type,
+                    "status": "filtered",
+                    "discarded_row_count": discarded_count,
+                    "detail": "Discarded SQL evidence rows with subject_id inconsistent with the request subject_id.",
+                }
+            )
         return SqlExecutionResult(
             resource_type=plan.resource_type,
             sql=validated_sql,
@@ -183,6 +228,21 @@ class SafeSqlRuntime:
                     f"Table '{table}' is not allowed for {plan.resource_type}."
                 )
 
+        if plan.expected_subject_id is not None:
+            subject_predicate = re.search(
+                r"\bWHERE\b[\s\S]*?\bsubject_id\b\s*=\s*:subject_id\b",
+                sql,
+                re.IGNORECASE,
+            )
+            if subject_predicate is None:
+                raise SubjectConsistencyError(
+                    "SQL query must include WHERE subject_id = :subject_id for subject consistency."
+                )
+            if plan.params.get("subject_id") != plan.expected_subject_id:
+                raise SubjectConsistencyError(
+                    "SQL query subject_id parameter does not match the request subject_id."
+                )
+
         limit_match = re.search(r"\bLIMIT\s+(\d+)\b", upper_sql)
         if limit_match:
             current_limit = int(limit_match.group(1))
@@ -204,3 +264,21 @@ def merge_sql_evidence(
         **raw_payload,
         "sql_evidence": sql_evidence,
     }
+
+
+def _filter_rows_by_subject_id(
+    rows: list[dict[str, Any]], expected_subject_id: int | str | None
+) -> tuple[list[dict[str, Any]], int]:
+    if expected_subject_id is None:
+        return rows, 0
+
+    filtered_rows: list[dict[str, Any]] = []
+    discarded_count = 0
+    for row in rows:
+        row_subject_id = row.get("subject_id")
+        if row_subject_id is not None and str(row_subject_id) == str(expected_subject_id):
+            filtered_rows.append(row)
+        else:
+            discarded_count += 1
+
+    return filtered_rows, discarded_count

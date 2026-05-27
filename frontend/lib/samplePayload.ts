@@ -6,10 +6,16 @@ export const DEFAULT_PAYLOAD = `{
       "anchor_age": 52,
       "anchor_year": 2180
     },
-    "admission": {
-      "hadm_id": 22595853,
-      "admittime": "2180-05-06T22:23:00"
-    },
+    "admissions": [
+      {
+        "hadm_id": 22595853,
+        "admittime": "2180-05-06T22:23:00"
+      },
+      {
+        "hadm_id": 22595854,
+        "admittime": "2180-06-01T08:15:00"
+      }
+    ],
     "lab_event": {
       "itemid": 50868,
       "label": "ANION GAP",

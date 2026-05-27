@@ -8,6 +8,7 @@ Rules:
 - Generate exactly one SELECT statement.
 - Use only the allowlisted schema/tables/columns shown in the prompt.
 - Use bind parameters such as :subject_id, :hadm_id, :itemid instead of literal values.
+- If subject_id is present in seed context, the SQL MUST include `WHERE subject_id = :subject_id`.
 - Do not use comments, DML, DDL, or multiple statements.
 - Keep the query minimal and deterministic.
 """
@@ -59,7 +60,7 @@ If errors exist, action must be "regenerate".
 
 
 MAPPING_SYSTEM_PROMPT = """You are the Mapping Agent.
-Map raw MIMIC-IV patient, admission, and lab event data into a normalized clinical representation.
+Map raw MIMIC-IV patient, admission or admissions, and lab event data into a normalized clinical representation.
 
 Rules:
 - Align concepts to LOINC/SNOMED CT only when there is enough evidence.
@@ -81,6 +82,7 @@ Retrieved grounding context:
 Return a JSON object with exactly these keys:
 - patient_demographics
 - encounter_context
+- encounter_contexts
 - observation_context
 - terminology_mapping
 - notes

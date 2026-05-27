@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .payload_utils import extract_admissions
+
+STORE_METADATA_FILE = ".builder_meta.json"
 
 
 @dataclass(frozen=True)
@@ -89,11 +92,20 @@ class RuntimeRetriever:
     ) -> str:
         patient = raw_payload.get("patient") or {}
         admission = raw_payload.get("admission") or {}
+        admissions = extract_admissions(raw_payload)
         lab_event = raw_payload.get("lab_event") or {}
+        admission_keys = sorted(
+            {
+                str(key)
+                for admission_row in admissions
+                for key in admission_row.keys()
+            }
+        )
         details = [
             f"resource_types={', '.join(resource_types)}",
             f"patient_keys={', '.join(sorted(patient.keys())) or 'none'}",
-            f"admission_keys={', '.join(sorted(admission.keys())) or 'none'}",
+            f"admission_keys={', '.join(admission_keys or sorted(admission.keys())) or 'none'}",
+            f"admission_count={len(admissions) or (1 if admission else 0)}",
             f"lab_itemid={lab_event.get('itemid', 'unknown')}",
             f"lab_label={lab_event.get('label', 'unknown')}",
         ]
@@ -124,16 +136,15 @@ class RuntimeRetriever:
         chunks.extend(schema_chunks)
         trace.append(schema_trace)
 
-        if self._medical_store_path.exists():
-            medical_chunks, medical_trace = self._retrieve_from_store(
-                store_name="medical",
-                store_path=self._medical_store_path,
-                query=query,
-                resource_types=resource_types,
-                purpose=purpose,
-            )
-            chunks.extend(medical_chunks)
-            trace.append(medical_trace)
+        medical_chunks, medical_trace = self._retrieve_from_store(
+            store_name="medical",
+            store_path=self._medical_store_path,
+            query=query,
+            resource_types=resource_types,
+            purpose=purpose,
+        )
+        chunks.extend(medical_chunks)
+        trace.append(medical_trace)
 
         if chunks:
             return chunks, trace
@@ -239,6 +250,8 @@ class RuntimeRetriever:
         if cache_key in self._vector_stores:
             return self._vector_stores[cache_key]
 
+        self._validate_store_metadata(store_name, store_path)
+
         chroma_class = self._resolve_chroma_class()
         embeddings = self._resolve_embeddings()
         if chroma_class is None or embeddings is None:
@@ -251,6 +264,35 @@ class RuntimeRetriever:
         )
         self._vector_stores[cache_key] = vector_store
         return vector_store
+
+    def _validate_store_metadata(self, store_name: str, store_path: Path) -> None:
+        metadata_path = store_path / STORE_METADATA_FILE
+        if not metadata_path.exists():
+            raise RuntimeError(
+                f"Vector store metadata is missing for {store_name}: {metadata_path}"
+            )
+
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+        expected_metadata = self._expected_store_metadata(store_name)
+        if metadata != expected_metadata:
+            raise RuntimeError(
+                f"Vector store metadata mismatch for {store_name}. Expected {expected_metadata}, got {metadata}."
+            )
+
+    def _expected_store_metadata(self, store_name: str) -> dict[str, str]:
+        provider = self._settings.rag_embedding_provider.strip().lower()
+        model = self._settings.rag_embedding_model
+        if provider == "ollama":
+            model = self._settings.ollama_embed_model or self._settings.rag_embedding_model
+
+        store_kind = "fhir_schema" if store_name == "schema" else "medical_knowledge"
+        return {
+            "store_kind": store_kind,
+            "embedding_provider": provider,
+            "embedding_model": model,
+        }
 
     def _resolve_chroma_class(self) -> Any | None:
         try:
@@ -270,7 +312,7 @@ class RuntimeRetriever:
                 return OllamaEmbeddings(
                     base_url=self._settings.ollama_base_url,
                     model=self._settings.ollama_embed_model
-                    or self._settings.ollama_model,
+                    or self._settings.rag_embedding_model,
                 )
             except Exception:
                 if not self._settings.rag_fail_open:

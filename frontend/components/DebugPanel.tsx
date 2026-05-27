@@ -1,4 +1,4 @@
-import type { DebugContext } from "@/api";
+import type { DebugContext } from "@/lib/api";
 import { JsonBlock } from "@/components/JsonBlock";
 import { Panel } from "@/components/Panel";
 

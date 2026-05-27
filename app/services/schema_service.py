@@ -18,10 +18,6 @@ class SchemaService:
         )
         self._default_resource_types = ["Patient", "Encounter", "Observation", "Bundle"]
 
-    @property
-    def schema_path(self) -> Path:
-        return self._schema_path
-
     @lru_cache(maxsize=1)
     def _load_schema_document(self) -> dict[str, Any]:
         with self._schema_path.open("r", encoding="utf-8") as handle:

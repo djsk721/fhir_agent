@@ -18,6 +18,8 @@ class Settings:
     mimic_admissions_table: str
     mimic_labevents_table: str
     mimic_d_labitems_table: str
+    mimic_d_items_table: str
+    mimic_d_icd_diagnoses_table: str
     patient_subject_id: int | None
     ollama_base_url: str
     ollama_model: str
@@ -99,10 +101,16 @@ def load_settings(env_file: str | None = None) -> Settings:
         or "labevents",
         mimic_d_labitems_table=os.getenv("MIMIC_D_LABITEMS_TABLE", "d_labitems").strip()
         or "d_labitems",
+        mimic_d_items_table=os.getenv("MIMIC_D_ITEMS_TABLE", "d_items").strip()
+        or "d_items",
+        mimic_d_icd_diagnoses_table=os.getenv(
+            "MIMIC_D_ICD_DIAGNOSES_TABLE", "d_icd_diagnoses"
+        ).strip()
+        or "d_icd_diagnoses",
         patient_subject_id=patient_subject_id,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
-        or "http://localhost:11434",
-        ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip() or "llama3.1:8b",
+        or "http://192.168.0.7:11434",
+        ollama_model=os.getenv("OLLAMA_MODEL", "qwen:").strip() or "llama3.1:8b",
         ollama_embed_model=os.getenv("OLLAMA_EMBED_MODEL", "").strip() or None,
         fhir_target_resources=output_resources,
         fhir_allowed_tables=allowed_tables,
@@ -113,7 +121,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         rag_enabled=_parse_bool(os.getenv("RAG_ENABLED", "true"), default=True),
         rag_top_k=int(os.getenv("RAG_TOP_K", "3").strip() or "3"),
         rag_fail_open=_parse_bool(os.getenv("RAG_FAIL_OPEN", "true"), default=True),
-        rag_embedding_provider=os.getenv("RAG_EMBEDDING_PROVIDER", "huggingface")
+        rag_embedding_provider=os.getenv("RAG_EMBEDDING_PROVIDER", "ollama")
         .strip()
         .lower()
         or "huggingface",

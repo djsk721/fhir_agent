@@ -11,12 +11,42 @@ export type DebugContext = {
 export type MimicPayload = {
   patient: JsonObject;
   admission?: JsonObject | null;
+  admissions?: JsonObject[] | null;
   lab_event?: JsonObject | null;
 };
 
 export type AnalyzeRequest = {
   payload: MimicPayload;
   resource_types?: string[];
+  enable_cross_validation?: boolean;
+};
+
+export type AnalyzeCorrection = string | Record<string, unknown>;
+
+export type CrossValidationSummary = {
+  status: string;
+  matched: number;
+  mismatched: number;
+  missing: number;
+  skipped: number;
+};
+
+export type CrossValidationItem = {
+  resource_type: string;
+  generated_id?: string | null;
+  generated_resource?: JsonObject | null;
+  reference_file?: string | null;
+  reference_line?: number | null;
+  reference_resource?: JsonObject | null;
+  status: string;
+  differences: unknown[];
+  skipped_reason?: string | null;
+};
+
+export type CrossValidationReport = {
+  summary: CrossValidationSummary;
+  items: CrossValidationItem[];
+  reference_directory?: string | null;
 };
 
 export type MappingRequest = {
@@ -27,9 +57,11 @@ export type MappingRequest = {
 
 export type AnalyzeResponse = {
   mapping_payload: JsonObject;
-  generated_resources: Record<string, JsonObject>;
+  generated_resources: Record<string, JsonObject | JsonObject[]>;
   fhir_bundle: JsonObject;
   verification_errors: string[];
+  corrections: AnalyzeCorrection[];
+  cross_validation: CrossValidationReport | null;
   attempts_used: number;
   debug_context: DebugContext;
 };
@@ -104,13 +136,14 @@ export function normalizeAnalyzeInput(input: unknown): AnalyzeRequest {
   if ("payload" in input) {
     const request = input as Partial<AnalyzeRequest>;
     if (!request.payload || typeof request.payload !== "object") {
-      throw new Error("The 'payload' field must contain patient/admission/lab_event data.");
+      throw new Error("The 'payload' field must contain patient/admission/admissions/lab_event data.");
     }
 
-    return {
-      payload: request.payload,
-      resource_types: request.resource_types,
-    };
+      return {
+        payload: request.payload,
+        resource_types: request.resource_types,
+        enable_cross_validation: request.enable_cross_validation,
+      };
   }
 
   return {

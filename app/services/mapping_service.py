@@ -7,6 +7,11 @@ from app.models.responses import DebugContext, MappingResponse
 from app.services.runtime import get_runtime_retriever, get_settings
 from app.services.schema_service import SchemaService
 from fhir_agent_pipeline.agents import MappingAgent, SqlPlannerAgent
+from fhir_agent_pipeline.encounter_generation import normalize_mapping_payload
+from fhir_agent_pipeline.payload_utils import (
+    canonical_subject_id,
+    prepare_payload_for_subject,
+)
 from fhir_agent_pipeline.sql_runtime import (
     SafeSqlRuntime,
     SqlQueryPlan,
@@ -47,7 +52,16 @@ class MappingService:
         return fallback_payload.model_dump()
 
     def explain_mapping(self, request: MappingRequest) -> MappingResponse:
-        payload = self._build_payload(request)
+        payload, subject_warnings = prepare_payload_for_subject(
+            self._build_payload(request),
+            self._sql_runtime,
+        )
+        raw_admissions = payload.get("admissions")
+        admission_count = (
+            len([admission for admission in raw_admissions if isinstance(admission, dict)])
+            if isinstance(raw_admissions, list)
+            else (1 if payload.get("admission") is not None else 0)
+        )
         retrieval_context = get_runtime_retriever().build_context(
             payload,
             ["Observation"],
@@ -58,6 +72,7 @@ class MappingService:
             rag_context=retrieval_context.mapping_prompt_context,
             sql_evidence=sql_evidence,
         )
+        mapping_payload = normalize_mapping_payload(mapping_payload)
 
         notes = mapping_payload.get("notes")
         terminology_mapping = mapping_payload.get("terminology_mapping", {})
@@ -69,7 +84,7 @@ class MappingService:
         if terminology_mapping:
             explanation_parts.append(f"terminology={terminology_mapping}")
 
-        warnings = []
+        warnings = list(subject_warnings)
         if request.payload is None:
             warnings.append(
                 "Mapping was inferred from a minimal itemid-only payload; provide full MIMIC JSON for stronger context."
@@ -81,7 +96,8 @@ class MappingService:
             schema_context=self._schema_service.build_schema_context(["Observation"]),
             source_payload_summary={
                 "has_patient": bool(payload.get("patient")),
-                "has_admission": payload.get("admission") is not None,
+                "has_admission": admission_count > 0,
+                "admission_count": admission_count,
                 "has_lab_event": payload.get("lab_event") is not None,
             },
             warnings=warnings,
@@ -119,6 +135,7 @@ class MappingService:
                     params=plan.params,
                     tables=plan.tables,
                     rationale=plan.rationale,
+                    expected_subject_id=canonical_subject_id(payload),
                 )
             )
             return {"Observation": execution.rows}, execution.trace

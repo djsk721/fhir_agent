@@ -4,91 +4,21 @@ import { useMemo, useState } from "react";
 
 import {
   getApiBaseUrl,
-  normalizeAnalyzeInput,
   postAnalyze,
   postMapping,
-  type AnalyzeRequest,
   type AnalyzeResponse,
   type DebugContext,
-  type MappingRequest,
   type MappingResponse,
-} from "@/api";
+} from "@/lib/api";
 import { DebugPanel } from "@/components/DebugPanel";
 import { InputPanel } from "@/components/InputPanel";
 import { MappingPanel } from "@/components/MappingPanel";
 import { OutputViewer } from "@/components/OutputViewer";
+import { buildAnalyzeRequest, buildMappingRequest } from "@/lib/request-utils";
 import { DEFAULT_PAYLOAD } from "@/lib/samplePayload";
 
 type StatusTone = "idle" | "loading" | "success" | "error";
 type RequestKind = "mapping" | "analyze" | null;
-
-function parseResourceTypes(input: string): string[] | undefined {
-  const resourceTypes = input
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  return resourceTypes.length > 0 ? resourceTypes : undefined;
-}
-
-function parsePayloadText(payloadText: string): unknown {
-  const trimmed = payloadText.trim();
-
-  if (!trimmed) {
-    throw new Error("Payload JSON is empty. Paste a valid request body before running mapping or analyze.");
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    throw new Error("Payload JSON is invalid. Check for a missing brace, quote, or comma and try again.");
-  }
-}
-
-function parseSubjectIdOverride(input: string): number | undefined {
-  const trimmed = input.trim();
-
-  if (!trimmed) {
-    return undefined;
-  }
-
-  if (!/^\d+$/.test(trimmed)) {
-    throw new Error("Subject ID must be a positive whole number when the override field is used.");
-  }
-
-  const subjectId = Number(trimmed);
-
-  if (!Number.isSafeInteger(subjectId) || subjectId <= 0) {
-    throw new Error("Subject ID must be a positive whole number when the override field is used.");
-  }
-
-  return subjectId;
-}
-
-function applySubjectIdOverride(request: AnalyzeRequest, subjectIdInput: string): AnalyzeRequest {
-  const subjectId = parseSubjectIdOverride(subjectIdInput);
-
-  if (subjectId === undefined) {
-    return request;
-  }
-
-  const patient = request.payload.patient;
-
-  if (!patient || typeof patient !== "object" || Array.isArray(patient)) {
-    throw new Error("Subject ID override requires payload.patient to be an object in the JSON input.");
-  }
-
-  return {
-    ...request,
-    payload: {
-      ...request.payload,
-      patient: {
-        ...patient,
-        subject_id: subjectId,
-      },
-    },
-  };
-}
 
 export default function HomePage() {
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
@@ -110,14 +40,7 @@ export default function HomePage() {
   };
 
   const parseAnalyzeRequest = () => {
-    const parsed = parsePayloadText(payloadText);
-    const request = normalizeAnalyzeInput(parsed);
-    const resourceTypes = parseResourceTypes(resourceTypesText) ?? request.resource_types;
-
-    return applySubjectIdOverride({
-      ...request,
-      resource_types: resourceTypes,
-    }, subjectIdOverride);
+    return buildAnalyzeRequest(payloadText, resourceTypesText, subjectIdOverride);
   };
 
   const runAnalyze = async () => {
@@ -148,15 +71,7 @@ export default function HomePage() {
 
     try {
       const analyzeRequest = parseAnalyzeRequest();
-      const request: MappingRequest = {
-        payload: analyzeRequest.payload,
-      };
-
-      if (mappingItemId.trim()) {
-        request.itemid = mappingItemId.trim();
-      }
-
-      const response = await postMapping(request);
+      const response = await postMapping(buildMappingRequest(analyzeRequest, mappingItemId));
       setMappingResult(response);
       setDebugContext(response.debug_context);
       setLastAction("mapping");
@@ -219,7 +134,7 @@ export default function HomePage() {
             </div>
             <div className="meta-row">
               <dt>Analyze request shape</dt>
-              <dd>{`{ payload, resource_types? }`}</dd>
+              <dd>{`{ payload, resource_types?, enable_cross_validation? }`}</dd>
             </div>
             <div className="meta-row">
               <dt>Mapping request shape</dt>
@@ -233,10 +148,15 @@ export default function HomePage() {
         </aside>
       </section>
 
-      <section className="content-grid">
-        <OutputViewer result={analyzeResult} />
-        <MappingPanel result={mappingResult} />
-        <DebugPanel debugContext={debugContext} lastAction={lastAction} />
+      <section className="results-workspace">
+        <div className="results-primary">
+          <OutputViewer result={analyzeResult} />
+        </div>
+
+        <div className="results-secondary-grid">
+          <MappingPanel result={mappingResult} />
+          <DebugPanel debugContext={debugContext} lastAction={lastAction} />
+        </div>
       </section>
     </main>
   );

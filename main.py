@@ -31,15 +31,19 @@ def main() -> dict[str, Any]:
         sql_runtime=SafeSqlRuntime(settings),
     )
     result = pipeline.run(seed_payload)
+    output = {
+        "corrected_resource": result.fhir_payload,
+        "corrections": result.corrections,
+    }
 
     if result.verification_errors:
-        print(json.dumps(result.fhir_payload, ensure_ascii=False, indent=2))
+        print(json.dumps(output, ensure_ascii=False, indent=2))
         raise RuntimeError(
             "FHIR verification failed: " + "; ".join(result.verification_errors)
         )
 
-    print(json.dumps(result.fhir_payload, ensure_ascii=False, indent=2))
-    return result.fhir_payload
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return output
 
 
 if __name__ == "__main__":

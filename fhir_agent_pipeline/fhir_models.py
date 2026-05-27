@@ -5,6 +5,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .fhir_corrections import (
+    BundleCorrectionResult,
+    ResourceCorrectionResult,
+    correct_fhir_bundle,
+    correct_fhir_resource,
+)
+
 
 class HumanName(BaseModel):
     """FHIR `HumanName`의 최소 구조를 표현합니다."""
@@ -151,18 +158,23 @@ def validate_fhir_json(resource: dict[str, Any], resource_type: str) -> tuple[bo
     return (len(errors) == 0), errors
 
 
-def build_bundle(resources: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def build_bundle(resources: dict[str, Any]) -> dict[str, Any]:
     """생성된 리소스들을 FHIR Bundle로 묶습니다."""
 
     entries: list[dict[str, Any]] = []
-    for resource_type, resource in resources.items():
-        resource_id = resource.get("id", resource_type.lower())
-        entries.append(
-            {
-                "fullUrl": f"urn:resource:{resource_type.lower()}:{resource_id}",
-                "resource": resource,
-            }
-        )
+    for resource_type, value in resources.items():
+        resource_group = value if isinstance(value, list) else [value]
+        for index, resource in enumerate(resource_group, start=1):
+            if not isinstance(resource, dict):
+                continue
+            resource_id = resource.get("id", f"{resource_type.lower()}-{index}")
+            entry_resource_type = str(resource.get("resourceType", resource_type)).lower()
+            entries.append(
+                {
+                    "fullUrl": f"urn:resource:{entry_resource_type}:{resource_id}",
+                    "resource": resource,
+                }
+            )
 
     return {
         "resourceType": "Bundle",
@@ -190,4 +202,66 @@ def validate_bundle(bundle: dict[str, Any], required_resource_types: list[str]) 
         if required_type not in actual_types:
             errors.append(f"Bundle is missing required resourceType '{required_type}'.")
 
+    patient_ids = [
+        str(entry.get("resource", {}).get("id"))
+        for entry in bundle.get("entry", [])
+        if isinstance(entry, dict)
+        and entry.get("resource", {}).get("resourceType") == "Patient"
+        and entry.get("resource", {}).get("id") is not None
+    ]
+    canonical_patient_id = patient_ids[0] if patient_ids else None
+    if canonical_patient_id is not None and any(
+        patient_id != canonical_patient_id for patient_id in patient_ids
+    ):
+        errors.append("Cross-resource subject inconsistency")
+
+    encounter_ids = {
+        str(entry.get("resource", {}).get("id"))
+        for entry in bundle.get("entry", [])
+        if isinstance(entry, dict)
+        and entry.get("resource", {}).get("resourceType") == "Encounter"
+        and entry.get("resource", {}).get("id") is not None
+    }
+
+    for entry in bundle.get("entry", []):
+        if not isinstance(entry, dict):
+            continue
+        resource = entry.get("resource", {})
+        if not isinstance(resource, dict):
+            continue
+        resource_type = resource.get("resourceType")
+        if resource_type in {"Encounter", "Observation"} and canonical_patient_id is not None:
+            subject_reference = resource.get("subject", {}).get("reference")
+            if subject_reference != f"Patient/{canonical_patient_id}":
+                errors.append("Cross-resource subject inconsistency")
+                break
+        if resource_type == "Observation":
+            encounter_reference = resource.get("encounter", {}).get("reference")
+            if encounter_reference is not None:
+                encounter_id = str(encounter_reference).split("/", 1)[-1]
+                if encounter_id not in encounter_ids:
+                    errors.append("Cross-resource subject inconsistency")
+                    break
+
     return (len(errors) == 0), errors
+
+
+__all__ = [
+    "BundleCorrectionResult",
+    "BundleResource",
+    "CodeableConcept",
+    "Coding",
+    "EncounterClass",
+    "EncounterResource",
+    "HumanName",
+    "ObservationResource",
+    "PatientResource",
+    "Period",
+    "Reference",
+    "ResourceCorrectionResult",
+    "build_bundle",
+    "correct_fhir_bundle",
+    "correct_fhir_resource",
+    "validate_bundle",
+    "validate_fhir_json",
+]

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.documents import Document
 
 if TYPE_CHECKING:
-    from config import Settings
+    from .config import Settings
 
 
 FHIR_SCHEMA_DEFAULT_EMBEDDING_MODEL = "qwen3-embedding"
@@ -45,7 +45,6 @@ def _resolve_embedding_runtime(
     ollama_model_name: str | None = None,
 ):
     normalized_provider = provider.strip().lower() if provider else "huggingface"
-    print("normalized_provider : ", normalized_provider)
     if normalized_provider == "ollama":
         from langchain_ollama import OllamaEmbeddings
 
@@ -154,25 +153,6 @@ def _schema_builder_config_from_env() -> dict[str, str | None]:
         "ollama_model_name": os.getenv("OLLAMA_EMBED_MODEL", "").strip()
         or None,
     }
-
-
-def _resolve_embeddings(settings: "Settings"):
-    if settings.rag_embedding_provider == "ollama":
-        from langchain_ollama import OllamaEmbeddings
-
-        return OllamaEmbeddings(
-            base_url=settings.ollama_base_url,
-            model=settings.ollama_embed_model or settings.rag_embedding_model,
-        )
-
-    try:
-        from langchain_huggingface import HuggingFaceEmbeddings
-
-        return HuggingFaceEmbeddings(model_name=settings.rag_embedding_model)
-    except Exception:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-
-        return HuggingFaceEmbeddings(model_name=settings.rag_embedding_model)
 
 
 def _resolve_huggingface_embeddings(model_name: str):
@@ -288,7 +268,10 @@ def _fetch_dictionary_rows(settings: "Settings", sql: str) -> list[dict[str, Any
     import pandas as pd
     from sqlalchemy import text
 
-    from db import _normalize_scalar, build_engine
+    try:
+        from .db import _normalize_scalar, build_engine
+    except ImportError:
+        from db import _normalize_scalar, build_engine
 
     engine = build_engine(settings)
     df = pd.read_sql_query(text(sql), con=engine)
@@ -546,7 +529,6 @@ def build_fhir_schema_vector_store(
         builder = FHIRSchemaKnowledgeBuilder(**_schema_builder_config_from_env())
         builder.get_or_build_db(force_rebuild=force_rebuild)
         return str(Path(builder.persist_directory))
-    print("settings : ", settings)
     FHIRSchemaKnowledgeBuilder(
         persist_directory=settings.fhir_schema_db_dir,
         schema_file_path=settings.fhir_schema_json_path,
@@ -562,10 +544,7 @@ def build_medical_knowledge_vector_store(
     settings: "Settings" | None = None,
     force_rebuild: bool = False,
 ) -> str:
-    from config import load_settings
-
-    runtime_settings = settings or load_settings()
-    print("runtime_settings : ", runtime_settings)
+    runtime_settings = settings or _load_settings()
     MedicalKnowledgeRetriever(
         settings=runtime_settings,
         persist_directory=runtime_settings.mimic_knowledge_db_dir,
@@ -581,10 +560,7 @@ def build_all_vector_stores(
     settings: "Settings" | None = None,
     force_rebuild: bool = False,
 ) -> dict[str, str]:
-    from config import load_settings
-
-    runtime_settings = settings or load_settings()
-    print(runtime_settings)
+    runtime_settings = settings or _load_settings()
     return {
         "fhir_schema": build_fhir_schema_vector_store(
             runtime_settings,
@@ -595,6 +571,15 @@ def build_all_vector_stores(
             force_rebuild=force_rebuild,
         ),
     }
+
+
+def _load_settings() -> "Settings":
+    try:
+        from .config import load_settings
+    except ImportError:
+        from config import load_settings
+
+    return load_settings()
 
 
 __all__ = [

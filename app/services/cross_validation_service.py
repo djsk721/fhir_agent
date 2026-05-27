@@ -79,6 +79,23 @@ def _normalize_resources_by_type(
     return normalized
 
 
+def _build_skipped_validation_result(
+    normalized_resources: dict[str, list[dict[str, Any]]],
+    fhir_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "summary": {
+            "status": "skipped",
+            "matched": 0,
+            "mismatched": 0,
+            "missing": 0,
+            "skipped": sum(len(resources) for resources in normalized_resources.values()),
+        },
+        "items": [],
+        "reference_directory": str(fhir_dir),
+    }
+
+
 def _reference_context(payload: MimicPayload) -> ReferenceContext:
     subject_id = payload.patient.get("subject_id")
     hadm_ids = [
@@ -430,30 +447,10 @@ class CrossValidationService:
     ) -> dict[str, Any]:
         normalized_resources = _normalize_resources_by_type(generated_resources)
         if not enabled:
-            return {
-                "summary": {
-                    "status": "skipped",
-                    "matched": 0,
-                    "mismatched": 0,
-                    "missing": 0,
-                    "skipped": sum(len(resources) for resources in normalized_resources.values()),
-                },
-                "items": [],
-                "reference_directory": str(self._fhir_dir),
-            }
+            return _build_skipped_validation_result(normalized_resources, self._fhir_dir)
 
         if not self._fhir_dir.exists():
-            return {
-                "summary": {
-                    "status": "skipped",
-                    "matched": 0,
-                    "mismatched": 0,
-                    "missing": 0,
-                    "skipped": sum(len(resources) for resources in normalized_resources.values()),
-                },
-                "items": [],
-                "reference_directory": str(self._fhir_dir),
-            }
+            return _build_skipped_validation_result(normalized_resources, self._fhir_dir)
 
         context = _reference_context(payload)
         patient_candidates, patient_reference_ids = _load_reference_patient_ids(

@@ -1,267 +1,44 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Any, Literal
-
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-from .fhir_corrections import (
-    BundleCorrectionResult,
-    ResourceCorrectionResult,
-    correct_fhir_bundle,
-    correct_fhir_resource,
-)
+from copy import deepcopy
+from typing import Any, Iterable
+from uuid import NAMESPACE_URL, uuid5
 
 
-class HumanName(BaseModel):
-    """FHIR `HumanName`의 최소 구조를 표현합니다."""
+def build_bundle(resources: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """생성된 리소스를 안정적인 fullUrl을 가진 FHIR collection Bundle로 묶습니다."""
 
-    family: str | None = None
-    given: list[str] | None = None
+    resource_list = list(resources)
+    full_urls: dict[str, str] = {}
+    for resource in resource_list:
+        resource_type = str(resource.get("resourceType", "Resource"))
+        resource_id = resource.get("id", resource_type.lower())
+        key = f"{resource_type}/{resource_id}"
+        if key in full_urls:
+            raise ValueError(f"Bundle 리소스 ID가 중복됩니다: {key}")
+        identity = f"mimic-fhir:{resource_type}:{resource_id}"
+        full_urls[key] = f"urn:uuid:{uuid5(NAMESPACE_URL, identity)}"
 
-
-class Reference(BaseModel):
-    """FHIR `Reference`의 최소 구조를 표현합니다."""
-
-    reference: str
-
-
-class Coding(BaseModel):
-    """FHIR `Coding`의 최소 구조를 표현합니다."""
-
-    system: str | None = None
-    code: str
-    display: str | None = None
-
-
-class CodeableConcept(BaseModel):
-    """FHIR `CodeableConcept`의 최소 구조를 표현합니다."""
-
-    coding: list[Coding] | None = None
-    text: str | None = None
-
-
-class Period(BaseModel):
-    """FHIR `Period`의 최소 구조를 표현합니다."""
-
-    start: str | None = None
-    end: str | None = None
-
-
-class EncounterClass(BaseModel):
-    """FHIR `Encounter.class`의 최소 구조를 표현합니다."""
-
-    system: str | None = None
-    code: str
-    display: str | None = None
-
-
-class PatientResource(BaseModel):
-    """FHIR R4 Patient 리소스의 경량 검증 모델입니다."""
-
-    model_config = ConfigDict(extra="allow")
-
-    resourceType: Literal["Patient"]
-    id: str | None = None
-    name: list[HumanName] | None = None
-    gender: Literal["male", "female", "other", "unknown"] | None = None
-    birthDate: date | None = None
-
-
-class EncounterResource(BaseModel):
-    """FHIR R4 Encounter 리소스의 경량 검증 모델입니다."""
-
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
-
-    resourceType: Literal["Encounter"]
-    id: str | None = None
-    status: str
-    class_fhir: EncounterClass = Field(alias="class")
-    subject: Reference
-    period: Period | None = None
-
-
-class ObservationResource(BaseModel):
-    """FHIR R4 Observation 리소스의 경량 검증 모델입니다."""
-
-    model_config = ConfigDict(extra="allow")
-
-    resourceType: Literal["Observation"]
-    id: str | None = None
-    status: str
-    code: CodeableConcept
-    subject: Reference
-    encounter: Reference | None = None
-    effectiveDateTime: str | None = None
-    valueString: str | None = None
-    valueQuantity: dict[str, Any] | None = None
-
-
-class BundleEntry(BaseModel):
-    """FHIR `Bundle.entry`의 최소 구조를 표현합니다."""
-
-    fullUrl: str | None = None
-    resource: dict[str, Any]
-
-
-class BundleResource(BaseModel):
-    """FHIR R4 Bundle 리소스의 경량 검증 모델입니다."""
-
-    model_config = ConfigDict(extra="allow")
-
-    resourceType: Literal["Bundle"]
-    type: str
-    entry: list[BundleEntry]
-
-
-def _format_validation_errors(exc: ValidationError) -> list[str]:
-    errors: list[str] = []
-    for item in exc.errors():
-        location = ".".join(str(part) for part in item.get("loc", []))
-        message = item.get("msg", "validation error")
-        errors.append(f"{location}: {message}" if location else str(message))
-    return errors
-
-
-def validate_fhir_json(resource: dict[str, Any], resource_type: str) -> tuple[bool, list[str]]:
-    """FHIR JSON의 최소 구조와 필수 필드를 검증합니다."""
-
-    if not isinstance(resource, dict):
-        return False, ["FHIR JSON must be an object."]
-
-    errors: list[str] = []
-    actual_resource_type = resource.get("resourceType")
-    if actual_resource_type != resource_type:
-        errors.append(
-            f"resourceType must be '{resource_type}', got '{actual_resource_type}'."
-        )
-        return False, errors
-
-    if resource_type == "Patient":
-        try:
-            PatientResource.model_validate(resource)
-        except ValidationError as exc:
-            errors.extend(_format_validation_errors(exc))
-
-    elif resource_type == "Encounter":
-        try:
-            EncounterResource.model_validate(resource)
-        except ValidationError as exc:
-            errors.extend(_format_validation_errors(exc))
-
-    elif resource_type == "Observation":
-        try:
-            ObservationResource.model_validate(resource)
-        except ValidationError as exc:
-            errors.extend(_format_validation_errors(exc))
-
-    return (len(errors) == 0), errors
-
-
-def build_bundle(resources: dict[str, Any]) -> dict[str, Any]:
-    """생성된 리소스들을 FHIR Bundle로 묶습니다."""
+    def rewrite_references(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("reference") in full_urls:
+                value["reference"] = full_urls[value["reference"]]
+            for nested in value.values():
+                rewrite_references(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                rewrite_references(nested)
 
     entries: list[dict[str, Any]] = []
-    for resource_type, value in resources.items():
-        resource_group = value if isinstance(value, list) else [value]
-        for index, resource in enumerate(resource_group, start=1):
-            if not isinstance(resource, dict):
-                continue
-            resource_id = resource.get("id", f"{resource_type.lower()}-{index}")
-            entry_resource_type = str(resource.get("resourceType", resource_type)).lower()
-            entries.append(
-                {
-                    "fullUrl": f"urn:resource:{entry_resource_type}:{resource_id}",
-                    "resource": resource,
-                }
-            )
-
-    return {
-        "resourceType": "Bundle",
-        "type": "collection",
-        "entry": entries,
-    }
-
-
-def validate_bundle(bundle: dict[str, Any], required_resource_types: list[str]) -> tuple[bool, list[str]]:
-    """최종 Bundle 구조와 포함 리소스를 검증합니다."""
-
-    errors: list[str] = []
-    try:
-        BundleResource.model_validate(bundle)
-    except ValidationError as exc:
-        errors.extend(_format_validation_errors(exc))
-        return False, errors
-
-    actual_types = [
-        entry.get("resource", {}).get("resourceType")
-        for entry in bundle.get("entry", [])
-        if isinstance(entry, dict)
-    ]
-    for required_type in required_resource_types:
-        if required_type not in actual_types:
-            errors.append(f"Bundle is missing required resourceType '{required_type}'.")
-
-    patient_ids = [
-        str(entry.get("resource", {}).get("id"))
-        for entry in bundle.get("entry", [])
-        if isinstance(entry, dict)
-        and entry.get("resource", {}).get("resourceType") == "Patient"
-        and entry.get("resource", {}).get("id") is not None
-    ]
-    canonical_patient_id = patient_ids[0] if patient_ids else None
-    if canonical_patient_id is not None and any(
-        patient_id != canonical_patient_id for patient_id in patient_ids
-    ):
-        errors.append("Cross-resource subject inconsistency")
-
-    encounter_ids = {
-        str(entry.get("resource", {}).get("id"))
-        for entry in bundle.get("entry", [])
-        if isinstance(entry, dict)
-        and entry.get("resource", {}).get("resourceType") == "Encounter"
-        and entry.get("resource", {}).get("id") is not None
-    }
-
-    for entry in bundle.get("entry", []):
-        if not isinstance(entry, dict):
-            continue
-        resource = entry.get("resource", {})
-        if not isinstance(resource, dict):
-            continue
-        resource_type = resource.get("resourceType")
-        if resource_type in {"Encounter", "Observation"} and canonical_patient_id is not None:
-            subject_reference = resource.get("subject", {}).get("reference")
-            if subject_reference != f"Patient/{canonical_patient_id}":
-                errors.append("Cross-resource subject inconsistency")
-                break
-        if resource_type == "Observation":
-            encounter_reference = resource.get("encounter", {}).get("reference")
-            if encounter_reference is not None:
-                encounter_id = str(encounter_reference).split("/", 1)[-1]
-                if encounter_id not in encounter_ids:
-                    errors.append("Cross-resource subject inconsistency")
-                    break
-
-    return (len(errors) == 0), errors
-
-
-__all__ = [
-    "BundleCorrectionResult",
-    "BundleResource",
-    "CodeableConcept",
-    "Coding",
-    "EncounterClass",
-    "EncounterResource",
-    "HumanName",
-    "ObservationResource",
-    "PatientResource",
-    "Period",
-    "Reference",
-    "ResourceCorrectionResult",
-    "build_bundle",
-    "correct_fhir_bundle",
-    "correct_fhir_resource",
-    "validate_bundle",
-    "validate_fhir_json",
-]
+    for resource in resource_list:
+        resource_type = str(resource.get("resourceType", "Resource"))
+        resource_id = resource.get("id", resource_type.lower())
+        bundled_resource = deepcopy(resource)
+        rewrite_references(bundled_resource)
+        entries.append(
+            {
+                "fullUrl": full_urls[f"{resource_type}/{resource_id}"],
+                "resource": bundled_resource,
+            }
+        )
+    return {"resourceType": "Bundle", "type": "collection", "entry": entries}

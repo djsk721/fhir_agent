@@ -1,519 +1,425 @@
-# MIMIC-IV Multi-Agent FHIR Pipeline
+# MIMIC-IV DB → LLM → FHIR
 
-이 프로젝트는 **MIMIC 스타일 임상 데이터**를 입력받아, **리소스별 LLM SQL planning + RAG grounding + 다중 에이전트 self-correction**을 통해 **FHIR 리소스와 Bundle**을 생성하는 시스템입니다.
+이 프로젝트의 단일 목적은 별도 PostgreSQL 서버의 MIMIC-IV 데이터를 LLM으로 조회하고,
+조회 결과를 FHIR R4 리소스로 변환한 뒤 검증하는 것입니다.
 
-현재 다음 실행 방식을 지원합니다.
+지원 리소스는 `Patient`, `Encounter`, `Condition`, `Procedure`, `Observation`입니다.
 
-- **CLI 실행**: `python main.py`
-- **FastAPI 백엔드**: `uvicorn main:app --host 0.0.0.0 --port 8000`
-- **Next.js 프론트엔드**: `frontend/`에서 `npm run dev`
-
----
-
-## 1. 핵심 기능
-
-### 1.1 Resource별 LLM SQL → Mapping → FHIR 변환
-- 입력: `patient`, `admission`, `lab_event` 중심의 seed JSON
-- 대상 리소스는 `.env`의 `FHIR_TARGET_RESOURCES` 또는 API의 `resource_types`로 결정됩니다.
-- 각 리소스별로:
-  1. SQL Planner Agent가 안전한 SELECT 계획을 생성하고
-  2. SafeSqlRuntime이 검증/실행하며
-  3. Mapping Agent가 raw payload + SQL evidence + retrieval context를 임상 의미 중심 JSON으로 정규화하고
-  4. FHIR Generator Agent가 리소스를 생성한 뒤
-  5. Verifier Agent + 로컬 validator + Manager Agent의 자기 수정 루프를 거쳐
-  6. 최종 FHIR Bundle을 반환합니다.
-
-### 1.2 리소스별 SQL Planning
-- `SqlPlannerAgent`가 리소스 타입에 맞는 **JSON SQL 계획**을 생성합니다.
-- 기본 허용 테이블 예시는 다음과 같습니다.
-  - `Patient` → `patients`
-  - `Encounter` → `admissions + patients`
-  - `Observation` → `labevents + admissions + patients + d_labitems`
-- 실제 SQL 실행은 LLM이 아니라 `SafeSqlRuntime`이 수행합니다.
-
-### 1.3 LLM 기반 Mapping
-- `MappingAgent`는 다음 입력을 함께 사용합니다.
-  - raw seed payload
-  - resource별 `sql_evidence`
-  - retrieval context
-- 반환 구조는 다음 키를 중심으로 구성됩니다.
-  - `patient_demographics`
-  - `encounter_context`
-  - `observation_context`
-  - `terminology_mapping`
-  - `notes`
-
-### 1.4 RAG 기반 Grounding
-- SQL planning, mapping, FHIR generation, verifier 단계 모두 retrieval context를 활용합니다.
-- 우선 사용 코퍼스:
-  - `fhir_schema_vectordb/`
-  - `mimic_docs_vectordb/` (존재 시)
-- vector retrieval이 불가능하면 `db/fhir.schema.json` 기반 fallback으로 동작합니다.
-
-### 1.5 FHIR 생성 + 검증 + 자기 수정 루프
-- `FhirGeneratorAgent`가 리소스 JSON을 생성합니다.
-- 생성 후 일부 리소스에는 **post-generation normalization**이 적용됩니다.
-  - `Patient` → 성별/생년 보정
-  - `Encounter` → `class` 보정
-- 이후 다음 두 검증이 함께 실행됩니다.
-  1. `VerifierAgent`의 LLM 검증
-  2. `validate_fhir_json()` / `validate_bundle()`의 로컬 구조 검증
-- 실패 시 `ManagerAgent`가 correction instruction을 생성하고 재시도합니다.
-- 재시도 피드백에는 **LLM verifier 오류와 로컬 schema 오류가 모두 포함**됩니다.
-
-### 1.6 웹 UI 제공
-- Next.js App Router 기반 프론트엔드 제공
-- 화면에서 다음 기능을 사용할 수 있습니다.
-  - JSON 입력
-  - Mapping 실행
-  - Analyze 실행
-  - FHIR 결과 확인
-  - Debug / trace 확인
-
----
-
-## 2. 실제 동작하는 API
-
-루트 엔드포인트 `/`는 서비스 상태와 사용 가능한 라우트 목록을 반환합니다.
-
-```json
-{
-  "service": "FHIR Agent Service",
-  "status": "ok",
-  "frontend_url": "http://localhost:3000",
-  "available_routes": ["/analyze", "/mapping", "/schema"]
-}
-```
-
-### `POST /mapping`
-Observation 중심의 SQL planning + mapping만 수행합니다.
-
-#### 요청 모델
-- `itemid: int | str | null`
-- `payload: MimicPayload | null`
-- `notes: str | null`
-
-`MappingRequest`는 **`itemid` 또는 `payload` 중 하나는 반드시 제공되어야 합니다.**
-
-#### 입력 예시
-```json
-{
-  "itemid": 50868,
-  "payload": {
-    "patient": {"subject_id": 10000032},
-    "admission": {"hadm_id": 22595853},
-    "lab_event": {"itemid": 50868, "label": "ANION GAP"}
-  }
-}
-```
-
-#### 반환
-- `itemid`
-- `mapping_payload`
-- `mapping_explanation`
-- `debug_context`
-  - `agent_sequence`
-  - `rag_context` (SQL trace 포함)
-  - `schema_context`
-  - `source_payload_summary`
-  - `warnings`
-
-#### 동작 특징
-- `/mapping`은 현재 `Observation` 리소스 기준으로 retrieval 및 SQL evidence를 구성합니다.
-- payload 없이 `itemid`만 전달한 경우 minimal payload를 구성해 mapping을 시도하며, 경고 메시지를 반환합니다.
-
----
-
-### `POST /analyze`
-전체 파이프라인을 수행합니다.
-
-#### 요청 모델
-- `payload: MimicPayload`
-- `resource_types: list[str] | null`
-
-`resource_types`를 전달하면 `.env`의 기본 리소스 목록 대신 해당 목록으로 파이프라인을 구성합니다.
-
-#### 입력 예시
-```json
-{
-  "payload": {
-    "patient": {"subject_id": 10000032},
-    "admission": {"hadm_id": 22595853},
-    "lab_event": {"itemid": 50868}
-  },
-  "resource_types": ["Patient", "Encounter", "Observation"]
-}
-```
-
-#### 반환
-- `mapping_payload`
-- `generated_resources`
-- `fhir_bundle`
-- `verification_errors`
-- `attempts_used`
-- `debug_context`
-  - `agent_sequence`
-  - `rag_context` (retrieval trace + SQL trace)
-  - `schema_context`
-  - `source_payload_summary`
-  - `warnings`
-
-#### 동작 특징
-- 리소스 생성 순서는 `Patient -> Encounter -> Observation`입니다.
-- 리소스 생성 실패 시 partial bundle과 함께 현재까지의 `verification_errors`를 반환할 수 있습니다.
-- `payload.lab_event`가 없으면 Observation 근거가 제한되었다는 warning이 추가될 수 있습니다.
-
----
-
-### `GET /schema`
-로컬 FHIR schema 일부를 반환합니다.
-
-#### 쿼리 파라미터
-- `resource_types: list[str] | null`
-
-#### 기본 지원 리소스
-- `Patient`
-- `Encounter`
-- `Observation`
-- `Bundle`
-
-#### 반환
-- `source`
-- `supported_resource_types`
-- `definitions`
-
----
-
-## 3. 구현 구조
-
-### 3.1 전체 아키텍처
+## 처리 흐름
 
 ```text
-Frontend (Next.js)
-  -> FastAPI (/analyze, /mapping, /schema)
-    -> app/services/*
-      -> fhir_agent_pipeline/*
-        -> RuntimeRetriever
-        -> SqlPlannerAgent
-        -> SafeSqlRuntime
-        -> MappingAgent
-        -> FhirGeneratorAgent
-        -> VerifierAgent
-        -> ManagerAgent
-        -> Local FHIR validators
+DB Schema + FHIR Schema/매핑
+             │
+             ▼
+       PostgreSQL pgvector
+             │
+환자 ID ──> LLM SQL 생성 ──> SQL 안전 검사 ──> 읽기 전용 DB 조회
+                                                │
+                                                ▼
+                          LLM FHIR JSON 생성 및 자동 교정
+                                                │
+                                                ▼
+                          Bundle 생성 ──> Schema/참조/HL7 검증
 ```
 
-주요 디렉터리:
+결정적 Builder, Mapping Advisor, 기존 FHIR NDJSON benchmark 경로는 제거했습니다.
+`convert`와 `export-validate`는 모두 같은 `LlmSqlToFhirPipeline`을 사용합니다.
 
-- `frontend/`
-  - Next.js App Router UI
-- `app/api/`
-  - FastAPI route 정의
-- `app/services/`
-  - API 요청을 실제 pipeline/runtime 호출로 연결하는 서비스 계층
-- `app/models/`
-  - request/response 모델
-- `fhir_agent_pipeline/`
-  - 실제 LLM + SQL + retrieval + FHIR 변환 로직
+## 현재 구현 내용
 
----
+### 핵심 실행 경로
 
-### 3.2 `/analyze` 파이프라인 처리 흐름
+`LlmSqlToFhirPipeline.run()`은 다음 순서로 동작합니다.
 
-1. 입력 payload와 대상 resource list를 결정합니다.
-2. `RuntimeRetriever`가 mapping용 / resource별 generation용 retrieval context를 구성합니다.
-3. `SqlPlannerAgent`가 리소스별 SQL 계획을 생성합니다.
-4. `SafeSqlRuntime`이 SQL을 검증/실행하고 `sql_evidence`를 구성합니다.
-5. `MappingAgent`가 raw payload + `sql_evidence` + retrieval context로 mapping JSON을 생성합니다.
-6. 각 리소스를 순서대로 생성합니다.
-   - `Patient`
-   - `Encounter`
-   - `Observation`
-7. 생성된 리소스에 normalization을 적용합니다.
-   - `normalize_patient_resource()`
-   - `normalize_encounter_resource()`
-8. `VerifierAgent`와 로컬 validator가 함께 검증합니다.
-9. 실패 시 `ManagerAgent`가 correction instruction을 만들고 재생성합니다.
-10. 모든 리소스가 성공하면 `build_bundle()`로 최종 Bundle을 생성합니다.
-11. `validate_bundle()`로 Bundle 전체를 검증합니다.
-12. retrieval trace와 SQL trace는 `debug_context.rag_context`로 노출됩니다.
+1. `.env`와 `db/mimic_mapping_config.json`을 읽고 설정값·리소스 의존성을 검사합니다.
+2. SQL/FHIR Vector 테이블의 존재 여부, 필수 컬럼, 행 수를 검사합니다.
+3. `ResourceAdapter` 순서에 따라 Patient → Encounter → Condition → Procedure → Observation을 처리합니다.
+4. SQL VectorDB 문맥으로 리소스별 PostgreSQL `SELECT`를 생성합니다.
+5. `SqlSafetyPolicy`가 SQL을 검사하고 `SafeSqlGateway`가 읽기 전용 트랜잭션에서 실행합니다.
+6. SQL 결과가 요청한 `subject_id`와 선택된 `hadm_id` 범위 안인지 확인합니다.
+7. DB `CHAR` 패딩을 제거하고 ICD 코드·system 등 LLM 입력용 소스 값을 정규화합니다.
+8. FHIR Schema/매핑 VectorDB 문맥, 소스 행, ID·참조 계약으로 FHIR JSON을 생성합니다.
+9. 실패한 FHIR 배치에는 이전 출력과 오류를 다시 전달해 설정 횟수만큼 자동 교정합니다.
+10. 생성 리소스를 DB 조회 행과 결정적 ID로 다시 대응시켜 값 정확도, 리소스 F1, 참조와 코딩 정확도를 계산합니다.
+11. Bundle로 조립하고 공식 Schema, 의미 규칙, 참조, 품질 지표와 HL7 Validator를 실행합니다.
+12. DB 엔진을 정리하고 Bundle, 검증 보고서와 LLM trace를 저장합니다.
 
----
+운영 기본값인 `VECTORS_ENABLED=true`에서는 VectorDB가 없거나 호환되지 않으면
+LLM 변환을 시작하지 않고 `build-vectors` 실행을 안내합니다. `false`는 RAG 비교
+실험의 LLM-only baseline을 만들 때만 사용합니다.
+또한 Condition, Procedure, Observation은 먼저 조회한 Encounter ID 범위 안에서만 생성됩니다.
 
-### 3.3 LLM 구현 방식
+### 리소스별 현재 매핑
 
-활성 런타임은 **Ollama + LangChain** 기반입니다.
+| FHIR 리소스 | 기본 DB 소스 | 주요 변환 정책 |
+|---|---|---|
+| Patient | `patients` | `subject_id` 기반 ID, 외부 `gender_map`, 조회 근거 없는 `birthDate` 차단 |
+| Encounter | `admissions` | `hadm_id` 기반 ID, admission type별 class, 퇴원 시간 기반 status와 period |
+| Condition | `diagnoses_icd` + `d_icd_diagnoses` | 입원 ID와 sequence 기반 ID, ICD-9/10 system·소수점, Patient/Encounter 참조 |
+| Procedure | `procedures_icd` + `d_icd_procedures` | 입원 ID와 sequence 기반 ID, ICD-9/10, performed date, Patient/Encounter 참조 |
+| Observation | `labevents` | event/row/item ID 후보, 검사값·단위·참고범위·flag, UCUM, Patient/Encounter 참조 |
 
-- 채팅 모델: `langchain_ollama.ChatOllama`
-- 공통 베이스: `BaseAgent`
-- 주요 에이전트:
-  - `SqlPlannerAgent`
-  - `MappingAgent`
-  - `FhirGeneratorAgent`
-  - `VerifierAgent`
-  - `ManagerAgent`
+### 대상 리소스 선정 이유
 
-각 에이전트는 `fhir_agent_pipeline/prompts.py`에 정의된 시스템/유저 프롬프트를 사용하며, 응답은 JSON-only를 전제로 파싱됩니다.
+이 5종은 `Patient → Encounter → Condition/Procedure/Observation`으로 이어지는 환자 중심
+임상 흐름을 FHIR Bundle로 표현하기 위한 초기 최소 범위입니다.
 
-현재 JSON 응답 파서는:
-- fenced code block 대응
-- 응답 내 첫 complete JSON block 추출
-- malformed JSON에 대해서는 명시적 실패
-를 수행하도록 보강되어 있습니다.
+- MIMIC-IV 원천 테이블과 `subject_id`, `hadm_id`, ICD code, lab event ID 등 대응 키가 명확함
+- 환자·입원·진단·처치·검사 간 참조 관계와 Bundle 무결성을 함께 검증할 수 있음
+- DB 원본을 기준으로 필드 정확도, Precision/Recall/F1, 값·단위·시간 정확도를 계산할 수 있음
+- 식별자, 시간, 코드, 수치, UCUM 단위와 참조 등 주요 FHIR 변환 유형을 고르게 포함함
 
----
+Medication 관련 리소스는 후속 확장 대상으로 둡니다. MIMIC-IV의 처방·조제·실제 투여·ICU
+주입 데이터는 의미가 서로 다르고, FHIR에서도 `MedicationRequest`,
+`MedicationAdministration`, `MedicationDispense` 등으로 목적별 모델이 나뉩니다. 약물명,
+용량, 단위, 경로와 RxNorm 표준화 기준을 먼저 정의해야 하므로 초기 검증 범위에서는 제외했습니다.
 
-### 3.4 SQL 생성 및 실행 방식
+실제 테이블명과 컬럼명은 `.env` 및 매핑 JSON에서 변경할 수 있습니다. ID는 코드에서 문자열을
+조합하지 않고 `resource_ids`의 `template` 또는 `candidates` 정책으로 생성합니다.
 
-SQL 생성은 `SqlPlannerAgent`, 실행은 `SafeSqlRuntime`이 담당합니다.
+### LLM SQL 생성과 안전 실행
 
-#### 동작 방식
-- resource type별 허용 테이블을 결정합니다.
-- SQLAlchemy inspector로 사용 가능한 테이블/컬럼 metadata를 조회합니다.
-- LLM이 단일 SELECT SQL + params JSON을 생성합니다.
-- `SafeSqlRuntime`이 아래 규칙으로 검증합니다.
-  - SELECT only
-  - comment / multi-statement 금지
-  - 허용 테이블만 사용
-  - LIMIT 강제
-  - bind parameter 사용
+`NaturalLanguageSqlAgent`는 SQL VectorDB에서 질문과 관련된 스키마 문서를 검색합니다. 생성 SQL이
+실패하면 PostgreSQL 오류를 다음 요청에 전달하며 `LLM_SQL_MAX_ATTEMPTS` 범위에서 교정합니다.
 
-#### allowlist 처리
-- `.env`의 `FHIR_ALLOWED_TABLES`가 있으면 해당 값 우선
-- 없으면 resource별 기본 allowlist 사용
+실행 단계에서는 다음을 코드로 강제합니다.
 
-#### 실패 전략
-- `SQL_FAIL_OPEN=true`면 SQL 계획/실행 실패 시 빈 evidence와 trace 오류를 남기고 계속 진행
-- `SQL_FAIL_OPEN=false`면 예외를 전파할 수 있습니다.
+- 문자열 리터럴을 제외한 다중 statement와 SQL 주석 차단
+- `INSERT`, `UPDATE`, `DELETE`, DDL, 권한·관리 명령 차단
+- `FOR UPDATE` 등 행 잠금 차단
+- 서버 파일, 지연, 외부 연결 함수 차단
+- `SQL_ALLOWED_SCHEMAS`, `SQL_ALLOWED_TABLES` 이외의 접근 차단
+- `SET TRANSACTION READ ONLY`, statement timeout, 최종 `LIMIT` 적용
 
----
+LLM이 올바른 SQL을 만들었더라도 결과 행의 환자 또는 입원 범위가 다르면 FHIR 생성으로 넘기지 않습니다.
 
-### 3.5 RAG 구현 방식
+### LLM FHIR 생성과 자동 교정
 
-RAG는 `RuntimeRetriever`가 담당합니다.
+`FhirLlmResourceService`는 `LLM_FHIR_BATCH_SIZE` 단위로 소스 행을 처리하며 각 행에
+0부터 시작하는 `source_row`를 요구합니다. 다음 조건을 모두 만족해야 배치가 채택됩니다.
 
-#### 동작 방식
-- mapping query와 resource별 generation query를 따로 구성합니다.
-- Chroma vector store에서 유사 문서를 검색합니다.
-- mapping용 context와 resource별 context를 각각 생성합니다.
-- retrieval 실패 시 local schema JSON fallback을 사용합니다.
+- 소스 행 수와 생성 리소스 수가 정확히 일치
+- `source_row` 누락·중복 없음
+- 매핑 정책으로 계산한 ID와 일치
+- Patient 및 Encounter 참조가 선택 범위와 일치
+- Patient gender, ICD system/code, UCUM code가 소스·매핑과 일치
+- 빈 배열이 없고 현재 Task 필수 필드가 존재
+- 공식 FHIR R4 JSON Schema 통과
 
-#### 현재 retrieval 소스
-- `FHIR_SCHEMA_DB_DIR`
-- `MIMIC_KNOWLEDGE_DB_DIR`
+실패 시 검증 오류와 이전 JSON을 LLM에 제공해 `LLM_FHIR_MAX_ATTEMPTS`까지 교정합니다.
+모든 시도가 실패하면 해당 리소스 유형에서 즉시 중단하며 불완전한 Bundle을 저장하지 않습니다.
 
-#### trace 정보
-`debug_context.rag_context`에는 다음 정보가 포함될 수 있습니다.
-- corpus
-- purpose (`mapping`, `generation:Patient` 등)
-- status (`vector`, `fallback_json`, `error`, `disabled` 등)
-- query
-- hit_count
-- detail
+### Bundle과 trace
 
----
+Bundle의 `fullUrl`은 `resourceType/id`에서 안정적으로 생성한 UUID이며, 내부의
+`Patient/{id}`, `Encounter/{id}` 참조는 해당 `urn:uuid:`로 변환합니다. 동일한
+`resourceType/id`가 두 번 나오면 Bundle 생성 단계에서 거부합니다.
 
-### 3.6 Normalization 동작
+`bundle.trace.json`에는 다음 정보가 들어갑니다.
 
-현재 구현에는 생성 직후 적용되는 normalization 단계가 있습니다.
+- 실행 모드 `llm-sql-and-llm-fhir`
+- 전체 및 리소스별 LLM 호출 횟수
+- 리소스별 DB 조회 행 수
+- 리소스별 질문, 최종 안전 SQL, 설명, SQL 교정 호출 수
+- SQL 초회 성공률, 안전 정책 거부 수, DB 실행 오류 수
+- FHIR 배치 초회 성공률, 자동 교정 성공률, 교정 시도와 오류 감소량
+- DB 원본 대비 필드 정확도, 리소스 F1, 참조와 용어 정확도
 
-#### Patient normalization
-- 성별 문자열을 FHIR administrative gender로 보정
-  - 예: `m` -> `male`, `f` -> `female`
-- `birthDate`가 없거나 잘못된 경우:
-  - 직접 제공된 생년 문자열 사용 시도
-  - 없으면 `anchor_year - anchor_age` 기반으로 `YYYY-01-01` 계산
+원본 DB 비밀번호나 전체 Vector 임베딩 값은 trace에 기록하지 않습니다.
 
-#### Encounter normalization
-- 이미 유효한 `class`가 있으면 유지
-- 없으면 `admission`, `hospitalization`, `type`, `serviceType`, `sql_evidence["Encounter"]` 등을 기반으로 `class`를 유도
-- 현재 다음 ActCode 계열 값을 생성할 수 있습니다.
-  - `EMER`
-  - `OBSENC`
-  - `AMB`
-  - `IMP`
-- 근거가 부족하면 무리하게 채우지 않고 validator가 실패하도록 둡니다.
+## 설치
 
-> 참고: ED timestamp와 입원 유형이 동시에 존재하는 mixed-evidence case는 향후 더 정교한 precedence tuning 대상입니다.
+Python 3.10 이상, PostgreSQL과 pgvector, Ollama가 필요합니다.
 
----
-
-### 3.7 FHIR 검증 및 자기 수정
-
-검증은 2단계입니다.
-
-1. **LLM verifier**
-   - `VerifierAgent`가 리소스를 검토
-
-2. **로컬 validator**
-   - `fhir_agent_pipeline/fhir_models.py`
-   - `validate_fhir_json()`
-   - `validate_bundle()`
-
-검증 실패 시:
-- LLM verifier 오류와 로컬 validator 오류를 합쳐서
-- `ManagerAgent.review_feedback()`에 전달하고
-- `correction_instructions`를 생성해 재시도합니다.
-
-즉 현재 self-correction loop는 **LLM 피드백만이 아니라 로컬 schema 오류도 재생성 피드백으로 사용**합니다.
-
----
-
-## 4. 주요 파일 구조
-
-```text
-project/
-├── app/
-│   ├── api/
-│   ├── core/
-│   ├── models/
-│   ├── services/
-│   └── main.py
-├── frontend/
-├── fhir_agent_pipeline/
-│   ├── agents.py
-│   ├── build_vector_stores.py
-│   ├── config.py
-│   ├── db.py
-│   ├── fhir_models.py
-│   ├── pipeline.py
-│   ├── prompts.py
-│   ├── retrieval.py
-│   └── sql_runtime.py
-├── tests/
-├── db/
-│   └── fhir.schema.json
-├── fhir_schema_vectordb/
-├── mimic_docs_vectordb/
-├── main.py
-└── requirements.txt
-```
-
----
-
-## 5. 환경 변수
-
-주요 환경 변수:
-
-- `MIMIC_DB_URL`
-- `MIMIC_SCHEMA`
-- `MIMIC_PATIENTS_TABLE`
-- `MIMIC_ADMISSIONS_TABLE`
-- `MIMIC_LABEVENTS_TABLE`
-- `MIMIC_D_LABITEMS_TABLE`
-- `PATIENT_SUBJECT_ID`
-- `OLLAMA_BASE_URL`
-- `OLLAMA_MODEL`
-- `OLLAMA_EMBED_MODEL`
-- `FHIR_TARGET_RESOURCES`
-- `FHIR_ALLOWED_TABLES`
-- `MAX_SELF_CORRECTION_ATTEMPTS`
-- `RAG_ENABLED`
-- `RAG_TOP_K`
-- `RAG_FAIL_OPEN`
-- `RAG_EMBEDDING_PROVIDER`
-- `RAG_EMBEDDING_MODEL`
-- `FHIR_SCHEMA_JSON_PATH`
-- `FHIR_SCHEMA_DB_DIR`
-- `MIMIC_KNOWLEDGE_DB_DIR`
-- `SQL_ENABLED`
-- `SQL_FAIL_OPEN`
-- `SQL_ROW_LIMIT`
-- `SQL_PLANNER_RETRIES`
-
----
-
-## 6. 설치
-
-### Python
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+
+ollama pull gemma4:e4b
+ollama pull nomic-embed-text
 ```
 
-### Frontend
+기존 `.env`가 있다면 덮어쓰지 말고 [.env.example](./.env.example)과 키만 맞추세요.
+실제 DB 비밀번호가 들어 있는 `.env`는 Git에 올리지 않습니다.
+
+## 환경 설정
+
+먼저 다음 값을 실제 환경에 맞게 수정합니다.
+
+```dotenv
+MIMIC_DB_URL=postgresql+psycopg2://사용자:비밀번호@DB서버:5432/mimiciv-2.2
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=gemma4:e4b
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_DIMENSION=768
+
+FHIR_SCHEMA_PATH=./db/fhir.schema.json
+MIMIC_MAPPING_CONFIG=./db/mimic_mapping_config.json
+MIMIC_FHIR_DATA_PATH=/home/mdhi/physionet.org/files/mimic-iv-fhir-demo
+FHIR_DEFAULT_TIMEZONE=Z
+```
+
+주요 실행 정책:
+
+| 설정 | 의미 | 예시 |
+|---|---|---:|
+| `PATIENT_SUBJECT_ID` | 명령행에서 생략할 기본 환자 ID | 빈 값 |
+| `FHIR_OUTPUT_RESOURCES` | 생성할 리소스 | 5종 전체 |
+| `MIMIC_MAX_ENCOUNTERS` | 환자당 최근 입원 수 | `1` |
+| `MIMIC_MAX_CONDITIONS_PER_ENCOUNTER` | 입원당 진단 수 | `10` |
+| `MIMIC_MAX_PROCEDURES_PER_ENCOUNTER` | 입원당 처치 수 | `10` |
+| `MIMIC_MAX_OBSERVATIONS_PER_ENCOUNTER` | 입원당 검사 수 | `10` |
+| `SQL_MAX_ROWS` | 안전 Gateway의 최종 행 제한 | `100` |
+| `LLM_SQL_MAX_ATTEMPTS` | SQL 자동 교정 포함 최대 호출 | `2` |
+| `LLM_FHIR_MAX_ATTEMPTS` | FHIR 배치 자동 교정 포함 최대 호출 | `2` |
+| `LLM_FHIR_BATCH_SIZE` | FHIR LLM 호출당 소스 행 수 | `2` |
+| `LLM_FHIR_CONTEXT_SEARCH_K` | FHIR Vector 문맥 수 | `20` |
+| `FHIR_VALIDATOR_JAR` | HL7 Validator CLI jar | 선택 사항 |
+
+소스 컬럼, 성별, Encounter class/status, ID 생성, ICD와 UCUM 규칙은
+[mimic_mapping_config.json](./db/mimic_mapping_config.json)에서 변경합니다.
+
+## 실행
+
+### 1. 연결 확인
+
 ```bash
-cd frontend
-npm install
+python main.py doctor
 ```
 
----
+FHIR Schema, 매핑 설정, 별도 DB 서버, Ollama 설정을 확인합니다.
 
-## 7. 실행 방법
+### 2. VectorDB 구축
 
-### 7.1 CLI
 ```bash
-python main.py
+python main.py build-vectors
+python main.py inspect-vectors
 ```
 
-CLI는 현재 seed payload를 기반으로 전체 pipeline을 수행하고, verification error가 없으면 최종 FHIR Bundle JSON을 출력합니다.
+| 기본 테이블 | 내용 |
+|---|---|
+| `public.fhir_mapping_vectors` | FHIR R4 JSON Schema와 MIMIC→FHIR 매핑 정책 |
+| `public.mimic_sql_schema_vectors` | 허용된 실제 DB 테이블·컬럼·PK·FK |
 
-### 7.2 Backend
+문서 `content_hash`가 바뀐 항목만 다시 임베딩하며 cosine 검색용 HNSW 인덱스를 만듭니다.
+
+### 3. 자연어 SQL 확인
+
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+python main.py ask "환자 10000032의 최근 입원을 보여줘"
 ```
 
-### 7.3 Frontend
+LLM SQL은 실행 전에 다음 정책을 통과해야 합니다.
+
+- `SELECT` 또는 `WITH ... SELECT` 한 문장
+- 허용된 스키마와 테이블만 접근
+- DDL, DML, 행 잠금, 서버 파일·외부 연결 함수 차단
+- 읽기 전용 트랜잭션과 statement timeout
+- 전체 SQL을 감싼 `SQL_MAX_ROWS` 강제 제한
+
+### 4. 환자 한 명 변환 및 검증
+
 ```bash
-cd frontend
-npm install
-npm run dev
+python main.py convert --subject-id 10000032 --hadm-id 25742920
 ```
 
-브라우저 접속:
+`--hadm-id`는 선택 사항입니다. 생략하면 설정된 개수만큼 최근 입원을 조회합니다.
+
+생성 파일:
+
+- `fhir_output/bundle.json`: 최종 FHIR Bundle
+- `fhir_output/bundle.validation.json`: 생성 직후 검증 결과
+- `fhir_output/bundle.trace.json`: LLM SQL, 조회 행 수와 호출 횟수
+- `fhir_output/refactor.revalidation.json`: 별도 프로세스의 재검증 결과
+
+### 5. 저장 Bundle 독립 재검증
+
+```bash
+python main.py validate fhir_output/bundle.json
+```
+
+### 6. 여러 환자 순차 변환
+
+```bash
+python main.py export-validate --subject-id 10000032
+python main.py export-validate --subject-id 10000032 --subject-id 10000048
+python main.py export-validate --limit 10
+python main.py export-validate --limit 10 --resume
+python main.py export-validate --all --resume
+```
+
+`--limit`과 `--all`의 환자 목록은 DB 전체 환자가 아니라 `MIMIC_FHIR_DATA_PATH` 아래
+최신 버전의 `fhir/MimicPatient.ndjson.gz`에서 읽습니다. demo Patient의 FHIR `id`는 UUID이므로
+DB 조회에는 `identifier[].value`의 숫자 `subject_id`를 사용합니다.
+
+- `--limit 10`: demo Patient NDJSON 순서의 앞 10명을 DB→LLM→FHIR로 변환
+- `--all`: demo Patient NDJSON에 포함된 모든 환자를 변환
+- `--subject-id`: demo cohort와 관계없이 명시한 환자만 변환
+- `--resume`: Bundle과 검증 파일이 모두 있는 환자는 LLM 생성을 건너뜀
+
+현재 제공된 demo Patient NDJSON에는 100명이 있습니다. 각 환자의 임상 내용은 demo FHIR 파일을
+그대로 복사하는 것이 아니라, 추출한 `subject_id`로 별도 DB를 조회하여 LLM이 새로 생성합니다.
+`manifest.json`의 `cohort`에는 demo Patient 파일 경로와 적용한 limit이 기록됩니다.
+현재 연결된 MIMIC DB와 대조한 결과 demo의 100개 `subject_id`가 모두 존재합니다.
+
+```bash
+python main.py validate-export fhir_export
+```
+
+## 검증 항목
+
+현재 Task의 대표 성능평가 지표는 다음 10개 영역으로 구성합니다.
+
+| 평가 영역 | 핵심 지표 | 주 용도 |
+|---|---|---|
+| FHIR 표준 적합성 | FHIR Validation Pass Rate | HL7 Validator와 Schema 표준 준수 |
+| 원천 충실도 | Source Field Accuracy | DB 조회 값 보존 |
+| 리소스 생성 정확도 | Resource Count Alignment | 원천 행 대비 누락·과생성 확인 |
+| Patient/Encounter | Field-level Accuracy | 단일 리소스 필드 매핑 |
+| Condition/Procedure | Precision, Recall, F1 | 다중 행 리소스 탐지 |
+| Observation | Detection F1 + Value/Unit Accuracy | 검사 행·값·단위 변환 |
+| 참조 무결성 | Reference Resolution Rate | Bundle 내부 연결성 |
+| 코드 품질 | Coding Accuracy | ICD/UCUM system과 code 매핑 |
+| 자동 교정 | Repair Success Rate | validation-guided self-correction 효과 |
+| RAG 효과 | RAG Ablation Improvement | LLM-only 대비 VectorDB 기여도 |
+
+`bundle.validation.json`에는 두 수준의 결과가 기록됩니다.
+
+- `metrics.performance_evaluation`: 위 표의 대표 지표만 용도별로 정리한 결과
+- `metrics.task_evaluation`: 평가 분자·분모와 리소스별 상세 결과
+
+대표 결과에는 `overall_task_pass`, `fhir_standard_conformance`,
+`source_fidelity`, `resource_generation_accuracy`, `patient_encounter`,
+`condition_procedure`, `observation`, `reference_integrity`, `coding_quality`,
+`self_correction`, `rag_effect`가 포함됩니다.
+
+상세 결과의 주요 항목:
+
+- `resource_count_alignment`: 기대/생성 개수, 차이, 일치율
+- `resource_identity_metrics`: 리소스별 TP/FP/FN과 precision/recall/F1
+- `observation_quality`: Detection F1, 값·단위·시각 정확도
+- `unsupported_top_level_fields`: 현재 조회·매핑 계약으로 설명되지 않는 필드
+- `generation`: 리소스별 FHIR 배치 초회 성공 수, repair 성공 수와 교정 횟수
+- `performance_evaluation.self_correction`: 전체 배치 초회 성공률, repair 성공률과 평균 교정 횟수
+- `sql`: SQL 초회 성공률, 응답 형식 오류, 안전 정책 거부, DB 실행 오류
+
+다환자 `manifest.json`도 `performance_evaluation`에 같은 구조의 cohort 지표를
+제공합니다. Accuracy는 환자별 비율의 단순 평균이 아니라 `correct/evaluated`를
+합산하며, F1은 TP/FP/FN을 합산하여 다시 계산합니다.
+
+분모가 0인 정확도는 “평가 대상 오류가 없음”을 뜻하도록 `1.0`으로 표시하며,
+각 지표에 `evaluated` 수를 같이 제공합니다. 예를 들어 UCUM 단위가 없는 환자의
+`ucum_code.accuracy=1.0`, `evaluated=0`은 UCUM 변환이 실제로 시험됐다는 뜻이 아닙니다.
+
+FHIR Validator는 구조와 표준 준수를 검사하지만 값의 DB 출처는 판단하지 못합니다.
+따라서 LLM 생성 단계의 강제 검사와 위의 DB 원본 기반 사후 평가를 함께 봐야 합니다.
+저장 Bundle만 `validate`하면 원본 DB 행이 없으므로 Task 평가는 새로 계산할 수 없습니다.
+`convert` 또는 `export-validate`로 생성할 때 계산된 Task 평가는 validation 파일에 보존되며,
+`validate-export` 재검증도 기존 값을 유지합니다.
+
+### 해석상의 한계
+
+- F1의 정답 key는 `mimic_mapping_config.json`의 결정적 resource ID입니다. 임상적으로 같은
+  사건을 다른 ID로 합치는 의미론적 중복 평가는 아직 포함하지 않습니다.
+- `unsupported_top_level_fields`는 현재 조회·매핑 계약 밖의 최상위 속성을 찾습니다.
+  모든 중첩 값의 임상적 환각을 판정하는 지표는 아닙니다.
+- SQL 안전 통과율은 코드의 allowlist/read-only 정책에 대한 통과율이지 SQL의 임상적 정답률이
+  아닙니다. 조회 범위와 반환 컬럼은 별도로 검사합니다.
+- 단일 실행의 `rag_ablation_improvement`는 `null`입니다. 같은 cohort와 생성 설정으로
+  LLM-only와 LLM+RAG를 각각 실행한 후에만 개선율을 계산합니다.
+
+### RAG ablation 비교
+
+두 실행은 출력 디렉터리 외의 환자 범위, 모델, 배치 크기, 시드 성격의 조건을
+동일하게 유지해야 합니다.
+
+```bash
+VECTORS_ENABLED=false FHIR_EXPORT_DIR=./fhir_export_no_rag \
+  python main.py export-validate --limit 10
+
+VECTORS_ENABLED=true FHIR_EXPORT_DIR=./fhir_export_rag \
+  python main.py export-validate --limit 10
+
+python main.py compare-rag \
+  fhir_export_no_rag/manifest.json \
+  fhir_export_rag/manifest.json
+```
+
+`compare-rag`는 지표별 `LLM+RAG - LLM-only` 절대 개선량과, 품질지표
+개선량의 평균인 `rag_ablation_improvement`를 출력합니다.
+
+매핑 계약에 포함되지 않은 최상위 필드 목록은 코드에 중복 선언하지 않고
+`db/mimic_mapping_config.json`의 `evaluation.allowed_top_level_fields`에서 관리합니다.
+
+## 코드 구조
 
 ```text
-http://localhost:3000
+main.py                                  CLI 진입점
+fhir_agent_pipeline/cli.py               명령 파싱과 결과 저장
+fhir_agent_pipeline/config.py            .env 설정과 범위 검증
+fhir_agent_pipeline/db.py                DB 엔진과 안전한 PostgreSQL 식별자
+fhir_agent_pipeline/vector_store.py      FHIR/SQL pgvector 구축과 검색
+fhir_agent_pipeline/sql_agent.py         LLM SQL 생성과 읽기 전용 Gateway
+fhir_agent_pipeline/llm_query_service.py 리소스별 SQL 질문·범위·소스 정규화
+fhir_agent_pipeline/agents.py            LLM FHIR JSON 호출
+fhir_agent_pipeline/llm_resource_service.py FHIR 계약·교정·소스 충실도
+fhir_agent_pipeline/llm_pipeline.py      전체 단계 오케스트레이션
+fhir_agent_pipeline/fhir_models.py       Bundle 조립과 내부 참조 변환
+fhir_agent_pipeline/fhir_schema.py       공식 R4 Schema 캐시
+fhir_agent_pipeline/validation.py        Schema·참조·품질·HL7 검증
+fhir_agent_pipeline/evaluation.py        DB 원본 충실도·리소스 F1·참조·코딩 평가
+fhir_agent_pipeline/performance.py       대표 지표 통합·cohort 집계·RAG 비교
+fhir_agent_pipeline/export_service.py    demo cohort 선택과 동일 LLM Pipeline의 다환자 실행
+db/mimic_mapping_config.json             외부 매핑 정책
+tests/                                   DB/Ollama 없이 실행하는 회귀 테스트
 ```
 
-프론트엔드는 기본적으로 `http://localhost:8000` 백엔드를 호출하며, 필요하면 `NEXT_PUBLIC_API_BASE_URL`로 변경할 수 있습니다.
+## 리팩터링 결과
 
----
+제거한 legacy/중복 구현:
 
-## 8. 현재 검증 상태
+- `pipeline.py`: 결정적 변환 Pipeline
+- `normalization.py`: Builder와 Builder를 상속한 Normalizer
+- `MappingAgent`와 Mapping Advisor 프롬프트
+- `--deterministic`, `--with-llm-advisor`, `benchmark` 명령
+- 직접 DB→Builder 추출 모델과 조회 함수
+- `PatientDemoRow`, `MultiAgentFhirPipeline` 등 호환 alias
+- 루트의 중복 `config.py`와 구형 환경 예제
+- 리소스별 Pydantic 클래스는 제거하고, JSON Schema 누락 필수값은 `ResourceAdapter`의 공통 규칙으로 통합
+- 세 군데에 있던 PostgreSQL 식별자 검사 구현
 
-현재 코드 기준 확인된 사항:
+현재 모든 생성 경로는 `LlmSqlToFhirPipeline` 하나로 수렴합니다.
 
-- FastAPI 앱이 `/analyze`, `/mapping`, `/schema`를 노출함
-- `/mapping`, `/analyze`가 `debug_context`에 retrieval trace 및 SQL trace를 포함해 반환함
-- JSON 응답 파서 관련 회귀 테스트 존재
-- schema validation feedback이 self-correction loop에 반영되는 테스트 존재
-- `Encounter.class` normalization 테스트 존재
-- `python -m unittest discover -s tests -p "test_*.py"` 기준 테스트가 통과하도록 유지되고 있음
+## 테스트 및 최근 실제 검증
 
-현재 `tests/`에는 예를 들어 다음 검증이 포함됩니다.
-- `test_agents_json_parsing.py`
-- `test_pipeline_self_correction.py`
-- `test_encounter_normalization.py`
+```bash
+pytest -q
+```
 
----
+2026-07-23 실제 환경에서 `gemma4:e4b`로 환자 `10000032`, 입원 `25742920`의
+DB 조회 → LLM FHIR 생성 → 자동 교정 → HL7 Validator → 독립 재검증을 확인했습니다.
 
-## 9. 현재 한계와 개선 포인트
+| 항목 | 결과 |
+|---|---:|
+| VectorDB | FHIR 11,503 / SQL 10 |
+| 조회·생성 리소스 | Patient 1 / Encounter 1 / Condition 10 / Procedure 1 / Observation 10 |
+| 전체 리소스 | 23 |
+| 전체 LLM 호출 | 20 (SQL 6 / FHIR 14) |
+| DB 원본 필드 정확도 | 256/256 (`1.0`) |
+| Condition/Procedure/Observation macro F1 | `1.0` |
+| 논리 참조 정확도 | 43/43 (`1.0`) |
+| coding system/code 정확도 | 42/42 (`1.0`) |
+| 근거 없는 최상위 필드 | 0 |
+| SQL 초회 성공 / 안전 통과 | `0.8` / `1.0` |
+| FHIR 자동 교정 | 1회, 최종 성공 |
+| HL7 Validator | fatal 0 / error 0 / warning 60 |
+| 독립 재검증 | `valid: true` |
 
-현재 구현은 실제 live SQL + RAG 경로를 갖고 있지만, 다음은 여전히 개선 여지가 있습니다.
+HL7 warning은 프로파일·권장 표현 관련 경고이며 fatal/error는 없었습니다. 이 실제 실행에서
+기존 구조 검증만으로 발견하지 못했던 Condition/Procedure `identifier.value` 불일치를 새
+원본 충실도 평가가 검출했고, source row별 기대 ID를 생성 계약과 강제 검사에 추가한 뒤
+재실행하여 256개 평가 필드가 모두 일치했습니다.
 
-- LOINC / SNOMED 전용 retrieval corpus 강화
-- 더 넓은 resource/table allowlist 확장
-- retrieval quality / score threshold 튜닝
-- self-correction 단계의 더 정교한 재계획 정책
-- Encounter mixed-evidence precedence 개선
-  - 예: ED timestamp가 있으면서 동시에 inpatient/observation evidence도 존재하는 경우
-- schema 외 의료 문서 코퍼스 품질 향상
-
----
-
-## 10. 요약
-
-이 프로젝트는 단순한 LLM 변환기가 아니라,
-
-- **MIMIC seed 입력을 받고**
-- **resource별 SQL을 LLM이 계획하고 SafeSqlRuntime이 실행한 뒤**
-- **RAG로 schema / 의료 문서 grounding context를 검색하고**
-- **LLM agent들이 mapping / generation / verification / correction을 수행하고**
-- **post-generation normalization과 local validation까지 거쳐**
-- **FHIR Bundle을 반환하는 시스템**입니다.
-
-즉 현재 구현은:
-
-- 고정 SQL 기반 prototype이 아니라
-- 실제 API / CLI / Frontend에 연결된
-- **resource-aware LLM SQL + RAG + self-correction + normalization runtime** 입니다.
+리팩터링 후 회귀 테스트 결과는 `28 passed`입니다.

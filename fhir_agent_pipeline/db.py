@@ -1,54 +1,38 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal
-from typing import Any
+import re
 
-import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from .config import Settings
 
 
-@dataclass(frozen=True)
-class PatientDemoRow:
-    """MIMIC-IV에서 추출한 환자 데모 데이터를 담습니다."""
-
-    patient: dict[str, Any]
-    admission: dict[str, Any] | None
-    lab_event: dict[str, Any] | None
-    admissions: list[dict[str, Any]] | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        """에이전트 입력용 직렬화 가능한 딕셔너리로 변환합니다."""
-
-        admissions = list(self.admissions or [])
-        if self.admission is not None and not admissions:
-            admissions = [self.admission]
-
-        return {
-            "patient": self.patient,
-            "admission": self.admission if self.admission is not None else (admissions[0] if admissions else None),
-            "admissions": admissions or None,
-            "lab_event": self.lab_event,
-        }
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def build_engine(settings: Settings) -> Engine:
-    """SQLAlchemy 엔진을 생성합니다."""
+    """설정된 별도 MIMIC PostgreSQL 서버의 SQLAlchemy 엔진을 만듭니다."""
 
-    return create_engine(settings.mimic_db_url, future=True, pool_pre_ping=True)
+    connect_args = (
+        {"connect_timeout": settings.db_connect_timeout_seconds}
+        if settings.mimic_db_url.startswith("postgresql")
+        else {}
+    )
+    return create_engine(
+        settings.mimic_db_url,
+        future=True,
+        pool_pre_ping=True,
+        connect_args=connect_args,
+    )
 
 
-def _normalize_scalar(value: Any) -> Any:
-    """DB 값을 JSON 직렬화 가능한 형태로 정규화합니다."""
+def quote_identifier(value: str) -> str:
+    if not _IDENTIFIER.fullmatch(value):
+        raise ValueError(f"안전하지 않은 PostgreSQL 식별자입니다: {value!r}")
+    return f'"{value}"'
 
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    return value
+
+def qualified_table(schema: str, table: str) -> str:
+    return f"{quote_identifier(schema)}.{quote_identifier(table)}"
+

@@ -5,7 +5,8 @@ from typing import Any
 
 from .config import Settings
 from .db import qualified_table
-from .mapping_config import MimicMappingConfig, TableColumns
+from .mapping_config import SourceMappingConfig, TableColumns
+from .source_profile import SourceProfile
 from .sql_agent import NaturalLanguageSqlAgent
 
 
@@ -44,11 +45,13 @@ class LlmClinicalQueryService:
     def __init__(
         self,
         settings: Settings,
-        mapping: MimicMappingConfig,
+        mapping: SourceMappingConfig,
         sql_agent: NaturalLanguageSqlAgent | None = None,
+        profile: SourceProfile | None = None,
     ) -> None:
         self.settings = settings
         self.mapping = mapping
+        self.profile = profile or SourceProfile.load(settings.source_profile_path)
         self.sql_agent = sql_agent or NaturalLanguageSqlAgent(settings)
 
     @property
@@ -61,9 +64,9 @@ class LlmClinicalQueryService:
     def query(
         self,
         resource_type: str,
-        subject_id: int,
-        admission_ids: list[int],
-        admission_id_override: int | None,
+        subject_id: int | str,
+        admission_ids: list[int | str],
+        admission_id_override: int | str | None,
     ) -> QueriedResourceRows:
         question = self._question(
             resource_type, subject_id, admission_ids, admission_id_override
@@ -84,16 +87,16 @@ class LlmClinicalQueryService:
             rows=rows,
         )
 
-    def admission_ids(self, rows: list[dict[str, Any]]) -> list[int]:
+    def admission_ids(self, rows: list[dict[str, Any]]) -> list[int | str]:
         column = self.mapping.admission_columns.get("admission_id")
-        return [int(row[column]) for row in rows]
+        return [row[column] for row in rows]
 
     def _question(
         self,
         resource_type: str,
-        subject_id: int,
-        admission_ids: list[int],
-        admission_id_override: int | None,
+        subject_id: int | str,
+        admission_ids: list[int | str],
+        admission_id_override: int | str | None,
     ) -> str:
         handlers = {
             "Patient": self._patient_question,
@@ -112,97 +115,116 @@ class LlmClinicalQueryService:
             raise ValueError(f"{resource_type} 조회 전에 Encounter 행이 필요합니다.")
         return handler(subject_id, admission_ids, admission_id_override)
 
-    def _patient_question(
-        self, subject_id: int, _admission_ids: list[int], _override: int | None
+    @staticmethod
+    def _sql_literal(value: int | str) -> str:
+        if isinstance(value, bool):
+            raise ValueError("환자/입원 키에는 boolean을 사용할 수 없습니다.")
+        if isinstance(value, int):
+            return str(value)
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _render_question(
+        self,
+        resource_type: str,
+        columns: TableColumns,
+        values: dict[str, Any],
     ) -> str:
-        columns = self.mapping.patient_columns
-        table = qualified_table(
-            self.settings.mimic_schema, self.settings.mimic_patients_table
+        query = self.profile.query_for(resource_type)
+        rendered_values = {
+            f"{logical_name}_column": physical_name
+            for logical_name, physical_name in columns.values.items()
+        }
+        rendered_values.update(values)
+        rendered_values["source_table"] = qualified_table(
+            self.settings.source_schema,
+            self.settings.source_table(query.source_table_role),
         )
-        return (
-            "Generate a PostgreSQL SELECT for one Patient source row. "
-            f"Read {columns.get('subject_id')}, {columns.get('gender')}, "
-            f"{columns.get('death_date')} from {table} where "
-            f"{columns.get('subject_id')} = {subject_id}. Return exactly these "
-            "physical column names and at most one row."
+        if query.dictionary_table_role:
+            rendered_values["dictionary_table"] = qualified_table(
+                self.settings.source_schema,
+                self.settings.source_table(query.dictionary_table_role),
+            )
+        return query.render(rendered_values)
+
+    def _patient_question(
+        self,
+        subject_id: int | str,
+        _admission_ids: list[int | str],
+        _override: int | str | None,
+    ) -> str:
+        return self._render_question(
+            "Patient",
+            self.mapping.patient_columns,
+            {"subject_id": self._sql_literal(subject_id)},
         )
 
     def _encounter_question(
-        self, subject_id: int, _admission_ids: list[int], override: int | None
+        self,
+        subject_id: int | str,
+        _admission_ids: list[int | str],
+        override: int | str | None,
     ) -> str:
         columns = self.mapping.admission_columns
-        table = qualified_table(
-            self.settings.mimic_schema, self.settings.mimic_admissions_table
-        )
         admission_filter = (
-            f" and {columns.get('admission_id')} = {override}"
+            f" and {columns.get('admission_id')} = {self._sql_literal(override)}"
             if override is not None
             else ""
         )
-        return (
-            "Generate a PostgreSQL SELECT for Encounter source rows. "
-            f"Read {columns.get('subject_id')}, {columns.get('admission_id')}, "
-            f"{columns.get('admission_type')}, {columns.get('start_time')}, "
-            f"{columns.get('end_time')} from {table} where "
-            f"{columns.get('subject_id')} = {subject_id}{admission_filter}. Order by "
-            f"{columns.get('start_time')} descending nulls last and limit "
-            f"{self.settings.max_encounters}. Return physical column names unchanged."
+        return self._render_question(
+            "Encounter",
+            columns,
+            {
+                "subject_id": self._sql_literal(subject_id),
+                "encounter_override_clause": admission_filter,
+                "limit": self.settings.max_encounters,
+            },
         )
 
     def _condition_question(
-        self, subject_id: int, admission_ids: list[int], _override: int | None
+        self,
+        subject_id: int | str,
+        admission_ids: list[int | str],
+        _override: int | str | None,
     ) -> str:
         columns = self.mapping.diagnosis_columns
-        source = qualified_table(
-            self.settings.mimic_schema, self.settings.mimic_diagnoses_table
-        )
-        dictionary = qualified_table(
-            self.settings.mimic_schema,
-            self.settings.mimic_diagnosis_dictionary_table,
-        )
-        ids = ", ".join(str(value) for value in admission_ids)
-        return (
-            "Generate a PostgreSQL SELECT for Condition source rows. Join "
-            f"{source} as source to {dictionary} as dictionary on "
-            f"source.{columns.get('code')} = dictionary.{columns.get('code')} and "
-            f"source.{columns.get('version')} = dictionary.{columns.get('version')}. "
-            f"Select source.{columns.get('subject_id')}, "
-            f"source.{columns.get('admission_id')}, source.{columns.get('sequence')}, "
-            f"source.{columns.get('code')}, source.{columns.get('version')}, and "
-            f"dictionary.{columns.get('display')} as {columns.get('display')}. "
-            f"Filter subject_id = {subject_id} and admission ID in ({ids}). Order by "
-            f"admission ID and sequence ascending and limit "
-            f"{self.settings.max_conditions_per_encounter * len(admission_ids)}."
+        return self._render_question(
+            "Condition",
+            columns,
+            {
+                "subject_id": self._sql_literal(subject_id),
+                "admission_ids": ", ".join(
+                    self._sql_literal(value) for value in admission_ids
+                ),
+                "limit": self.settings.max_conditions_per_encounter
+                * len(admission_ids),
+            },
         )
 
     def _procedure_question(
-        self, subject_id: int, admission_ids: list[int], _override: int | None
+        self,
+        subject_id: int | str,
+        admission_ids: list[int | str],
+        _override: int | str | None,
     ) -> str:
         columns = self.mapping.procedure_columns
-        source = qualified_table(
-            self.settings.mimic_schema, self.settings.mimic_procedures_table
-        )
-        dictionary = qualified_table(
-            self.settings.mimic_schema,
-            self.settings.mimic_procedure_dictionary_table,
-        )
-        ids = ", ".join(str(value) for value in admission_ids)
-        return (
-            "Generate a PostgreSQL SELECT for Procedure source rows. Join "
-            f"{source} as source to {dictionary} as dictionary on "
-            f"source.{columns.get('code')} = dictionary.{columns.get('code')} and "
-            f"source.{columns.get('version')} = dictionary.{columns.get('version')}. "
-            f"Select source.{columns.get('subject_id')}, "
-            f"source.{columns.get('admission_id')}, source.{columns.get('sequence')}, "
-            f"source.{columns.get('date')}, source.{columns.get('code')}, "
-            f"source.{columns.get('version')}, and dictionary.{columns.get('display')} "
-            f"as {columns.get('display')}. Filter subject_id = {subject_id} and "
-            f"admission ID in ({ids}). Order by admission ID and sequence ascending "
-            f"and limit {self.settings.max_procedures_per_encounter * len(admission_ids)}."
+        return self._render_question(
+            "Procedure",
+            columns,
+            {
+                "subject_id": self._sql_literal(subject_id),
+                "admission_ids": ", ".join(
+                    self._sql_literal(value) for value in admission_ids
+                ),
+                "limit": self.settings.max_procedures_per_encounter
+                * len(admission_ids),
+            },
         )
 
     def _observation_question(
-        self, subject_id: int, admission_ids: list[int], _override: int | None
+        self,
+        subject_id: int | str,
+        admission_ids: list[int | str],
+        _override: int | str | None,
     ) -> str:
         columns = self.mapping.lab_columns
         selected_columns = [
@@ -213,19 +235,18 @@ class LlmClinicalQueryService:
                 "reference_low", "reference_high", "interpretation",
             )
         ]
-        table = qualified_table(
-            self.settings.mimic_schema, self.settings.mimic_labevents_table
-        )
-        ids = ", ".join(str(value) for value in admission_ids)
-        return (
-            "Generate a PostgreSQL SELECT for laboratory Observation source rows. "
-            f"Select {', '.join(selected_columns)} from {table} where "
-            f"{columns.get('subject_id')} = {subject_id} and "
-            f"{columns.get('admission_id')} in ({ids}). Order by "
-            f"{columns.get('admission_id')} and {columns.get('event_time')} descending "
-            f"nulls last and limit "
-            f"{self.settings.max_observations_per_encounter * len(admission_ids)}. "
-            "Return physical column names unchanged."
+        return self._render_question(
+            "Observation",
+            columns,
+            {
+                "selected_columns": ", ".join(selected_columns),
+                "subject_id": self._sql_literal(subject_id),
+                "admission_ids": ", ".join(
+                    self._sql_literal(value) for value in admission_ids
+                ),
+                "limit": self.settings.max_observations_per_encounter
+                * len(admission_ids),
+            },
         )
 
     def _columns_for(self, resource_type: str) -> TableColumns:
@@ -235,8 +256,8 @@ class LlmClinicalQueryService:
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
-        subject_id: int,
-        admission_ids: list[int],
+        subject_id: int | str,
+        admission_ids: list[int | str],
     ) -> None:
         if not rows:
             raise ValueError(f"LLM SQL이 {resource_type} 소스 행을 반환하지 않았습니다.")
@@ -247,7 +268,7 @@ class LlmClinicalQueryService:
                 raise ValueError(
                     f"{resource_type} SQL 결과에 {subject_column} 컬럼이 없습니다."
                 )
-            if int(row[subject_column]) != subject_id:
+            if str(row[subject_column]) != str(subject_id):
                 raise ValueError(
                     f"{resource_type}[{index}]가 요청 환자 범위를 벗어났습니다."
                 )
@@ -257,7 +278,9 @@ class LlmClinicalQueryService:
                     raise ValueError(
                         f"{resource_type} SQL 결과에 {admission_column} 컬럼이 없습니다."
                     )
-                if int(row[admission_column]) not in admission_ids:
+                if str(row[admission_column]) not in {
+                    str(value) for value in admission_ids
+                }:
                     raise ValueError(
                         f"{resource_type}[{index}]가 선택 입원 범위를 벗어났습니다."
                     )

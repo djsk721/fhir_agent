@@ -7,7 +7,7 @@ from .agents import FhirResourceGenerationAgent
 from .config import Settings
 from .fhir_schema import FhirSchemaRepository
 from .json_utils import dump_json
-from .mapping_config import MimicMappingConfig
+from .mapping_config import SourceMappingConfig
 from .resource_registry import resource_semantic_errors
 from .vector_store import PgVectorKnowledgeStore
 
@@ -68,7 +68,7 @@ class FhirLlmResourceService:
     def __init__(
         self,
         settings: Settings,
-        mapping: MimicMappingConfig,
+        mapping: SourceMappingConfig,
         schema: FhirSchemaRepository,
         agent: FhirResourceGenerationAgent,
         vector_store: PgVectorKnowledgeStore | None,
@@ -83,7 +83,7 @@ class FhirLlmResourceService:
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
-        subject_id: int,
+        subject_id: int | str,
     ) -> FhirGenerationResult:
         context = self._fhir_context(resource_type)
         resources: list[dict[str, Any]] = []
@@ -141,7 +141,7 @@ class FhirLlmResourceService:
 
     def _fhir_context(self, resource_type: str) -> str:
         query = (
-            f"FHIR R4 {resource_type} required fields identifiers references MIMIC "
+            f"FHIR R4 {resource_type} required fields identifiers references source "
             "source columns timezone ICD terminology UCUM mapping"
         )
         matches = (
@@ -182,7 +182,7 @@ class FhirLlmResourceService:
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
-        subject_id: int,
+        subject_id: int | str,
     ) -> str:
         patient_id = self.mapping.resource_id(
             "Patient", {"subject_id": subject_id}
@@ -238,7 +238,7 @@ class FhirLlmResourceService:
             },
         }
 
-    def _encounter_contract(self, subject_id: int) -> dict[str, Any]:
+    def _encounter_contract(self, subject_id: int | str) -> dict[str, Any]:
         mapping = self.mapping
         patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
         return {
@@ -265,7 +265,7 @@ class FhirLlmResourceService:
             },
         }
 
-    def _condition_contract(self, subject_id: int) -> dict[str, Any]:
+    def _condition_contract(self, subject_id: int | str) -> dict[str, Any]:
         mapping = self.mapping
         patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
         return {
@@ -296,7 +296,7 @@ class FhirLlmResourceService:
             },
         }
 
-    def _procedure_contract(self, subject_id: int) -> dict[str, Any]:
+    def _procedure_contract(self, subject_id: int | str) -> dict[str, Any]:
         mapping = self.mapping
         patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
         return {
@@ -324,7 +324,7 @@ class FhirLlmResourceService:
             },
         }
 
-    def _observation_contract(self, subject_id: int) -> dict[str, Any]:
+    def _observation_contract(self, subject_id: int | str) -> dict[str, Any]:
         mapping = self.mapping
         patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
         ucum_system = str(mapping.fhir_default("ucum_system"))
@@ -395,7 +395,7 @@ class FhirLlmResourceService:
         resource_type: str,
         rows: list[dict[str, Any]],
         payload: Any,
-        subject_id: int,
+        subject_id: int | str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         if not isinstance(payload, dict) or not isinstance(payload.get("resources"), list):
             return [], ["응답에 resources 배열이 없습니다."]
@@ -448,7 +448,7 @@ class FhirLlmResourceService:
         resource_type: str,
         row: dict[str, Any],
         resource: dict[str, Any],
-        subject_id: int,
+        subject_id: int | str,
         index: int,
         errors: list[str],
     ) -> None:

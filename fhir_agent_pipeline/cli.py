@@ -15,12 +15,13 @@ from .db import build_engine
 from .export_service import (
     ExportRequest,
     FhirBatchExportService,
-    resolve_demo_patient_file,
+    resolve_cohort_patient_file,
     validate_export_directory,
 )
 from .json_utils import dump_json
 from .llm_pipeline import LlmSqlToFhirPipeline
 from .performance import compare_rag_performance
+from .source_profile import SourceProfile
 from .sql_agent import NaturalLanguageSqlAgent
 from .validation import validate_bundle_detailed
 from .vector_store import PgVectorKnowledgeStore, build_knowledge_bases
@@ -44,18 +45,29 @@ def _save_conversion(
 
 
 def convert(
-    subject_id: int | None = None,
-    admission_id: int | None = None,
+    subject_id: int | str | None = None,
+    admission_id: int | str | None = None,
 ) -> dict[str, Any]:
     settings = load_settings()
+    profile = SourceProfile.load(settings.source_profile_path)
+
+    def normalize(value: int | str | None) -> int | str | None:
+        if value is None or not isinstance(value, str):
+            return value
+        return int(value) if profile.cohort.key_type == "integer" else value
+
     selected_subject_id = (
-        subject_id if subject_id is not None else settings.patient_subject_id
+        normalize(subject_id)
+        if subject_id is not None
+        else settings.patient_subject_id
     )
     if selected_subject_id is None:
         raise ValueError(
-            "LLM 변환에는 --subject-id 또는 PATIENT_SUBJECT_ID가 필요합니다."
+            "LLM 변환에는 --subject-id 또는 SOURCE_PATIENT_ID가 필요합니다."
         )
-    result = LlmSqlToFhirPipeline(settings).run(selected_subject_id, admission_id)
+    result = LlmSqlToFhirPipeline(settings).run(
+        selected_subject_id, normalize(admission_id)
+    )
     generation_mode = "llm-sql-and-llm-fhir"
     trace = result.trace_dict()
     validation = (
@@ -117,7 +129,7 @@ def validate_file(path: str) -> dict[str, Any]:
 
 
 def _database_diagnostic(settings: Settings) -> str | dict[str, Any]:
-    if not settings.mimic_db_url:
+    if not settings.source_db_url:
         return "not configured"
     try:
         with build_engine(settings).connect() as connection:
@@ -140,19 +152,19 @@ def _database_diagnostic(settings: Settings) -> str | dict[str, Any]:
 def doctor() -> dict[str, Any]:
     settings = load_settings(require_database=False)
     try:
-        demo_patient_file = str(
-            resolve_demo_patient_file(settings.mimic_fhir_demo_path)
-        )
-    except FileNotFoundError as exc:
+        demo_patient_file = str(resolve_cohort_patient_file(settings))
+    except (FileNotFoundError, ValueError) as exc:
         demo_patient_file = str(exc)
     result: dict[str, Any] = {
+        "source_profile": str(settings.source_profile_path),
+        "source_profile_exists": settings.source_profile_path.is_file(),
         "fhir_schema_path": str(settings.fhir_schema_path),
         "fhir_schema_exists": settings.fhir_schema_path.is_file(),
-        "mimic_mapping_config": str(settings.mimic_mapping_config_path),
-        "mimic_mapping_config_exists": settings.mimic_mapping_config_path.is_file(),
+        "source_mapping_config": str(settings.source_mapping_config_path),
+        "source_mapping_config_exists": settings.source_mapping_config_path.is_file(),
         "fhir_default_timezone": settings.fhir_default_timezone,
-        "mimic_fhir_demo_path": str(settings.mimic_fhir_demo_path),
-        "demo_patient_file": demo_patient_file,
+        "source_data_path": str(settings.source_data_path),
+        "cohort_patient_file": demo_patient_file,
         "fhir_export_directory": str(settings.fhir_export_directory),
         "database": _database_diagnostic(settings),
         "ollama": settings.ollama_base_url,
@@ -168,18 +180,23 @@ def doctor() -> dict[str, Any]:
 
 def export_validate(
     *,
-    subject_ids: list[int] | None,
+    subject_ids: list[int | str] | None,
     limit: int | None,
     all_demo_patients: bool,
     output_directory: str | None,
     resume: bool,
 ) -> dict[str, Any]:
     settings = load_settings()
+    profile = SourceProfile.load(settings.source_profile_path)
+    normalized_subject_ids = tuple(
+        int(value) if profile.cohort.key_type == "integer" else str(value)
+        for value in (subject_ids or ())
+    )
     request = ExportRequest(
         output_directory=(
             Path(output_directory) if output_directory else settings.fhir_export_directory
         ),
-        subject_ids=tuple(subject_ids or ()),
+        subject_ids=normalized_subject_ids,
         limit=limit,
         all_demo_patients=all_demo_patients,
         resume=resume,
@@ -236,12 +253,12 @@ def compare_rag(baseline_path: str, rag_path: str) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MIMIC-IV → FHIR 변환, 자연어 SQL, pgvector 관리 CLI"
+        description="임상 DB → FHIR 변환, 자연어 SQL, pgvector 관리 CLI"
     )
     commands = parser.add_subparsers(dest="command")
     convert_parser = commands.add_parser("convert", help="환자 1명의 FHIR Bundle 생성")
-    convert_parser.add_argument("--subject-id", type=int)
-    convert_parser.add_argument("--hadm-id", type=int)
+    convert_parser.add_argument("--subject-id")
+    convert_parser.add_argument("--encounter-id", "--hadm-id", dest="hadm_id")
     ask_parser = commands.add_parser("ask", help="자연어 질문을 안전한 SELECT로 조회")
     ask_parser.add_argument("question")
     commands.add_parser(
@@ -258,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     selectors = export_parser.add_mutually_exclusive_group(required=True)
     selectors.add_argument(
-        "--subject-id", type=int, action="append", dest="subject_ids",
+        "--subject-id", action="append", dest="subject_ids",
         help="특정 환자 ID. 여러 번 지정 가능",
     )
     selectors.add_argument(

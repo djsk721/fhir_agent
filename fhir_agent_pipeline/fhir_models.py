@@ -5,7 +5,9 @@ from typing import Any, Iterable
 from uuid import NAMESPACE_URL, uuid5
 
 
-def build_bundle(resources: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def build_bundle(
+    resources: Iterable[dict[str, Any]], namespace: str = "fhir-source"
+) -> dict[str, Any]:
     """생성된 리소스를 안정적인 fullUrl을 가진 FHIR collection Bundle로 묶습니다."""
 
     resource_list = list(resources)
@@ -16,7 +18,7 @@ def build_bundle(resources: Iterable[dict[str, Any]]) -> dict[str, Any]:
         key = f"{resource_type}/{resource_id}"
         if key in full_urls:
             raise ValueError(f"Bundle 리소스 ID가 중복됩니다: {key}")
-        identity = f"mimic-fhir:{resource_type}:{resource_id}"
+        identity = f"{namespace}:{resource_type}:{resource_id}"
         full_urls[key] = f"urn:uuid:{uuid5(NAMESPACE_URL, identity)}"
 
     def rewrite_references(value: Any) -> None:

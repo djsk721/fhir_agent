@@ -10,9 +10,10 @@ from .evaluation import evaluate_task_output
 from .fhir_schema import get_fhir_schema
 from .llm_query_service import LlmClinicalQueryService, LlmQueryTrace
 from .llm_resource_service import FhirLlmResourceService
-from .mapping_config import MimicMappingConfig
+from .mapping_config import SourceMappingConfig
 from .performance import build_performance_metrics
 from .resource_registry import selected_adapters
+from .source_profile import SourceProfile
 from .validation import ValidationReport, validate_bundle_detailed
 from .vector_store import PgVectorKnowledgeStore
 
@@ -66,11 +67,12 @@ class LlmSqlToFhirPipeline:
         resource_service: FhirLlmResourceService | None = None,
     ) -> None:
         self.settings = settings
-        mapping = MimicMappingConfig.load(settings.mimic_mapping_config_path)
+        self.profile = SourceProfile.load(settings.source_profile_path)
+        mapping = SourceMappingConfig.load(settings.source_mapping_config_path)
         self.mapping = mapping
         schema = get_fhir_schema(settings.fhir_schema_path)
         self.query_service = query_service or LlmClinicalQueryService(
-            settings, mapping
+            settings, mapping, profile=self.profile
         )
         if resource_service is None:
             vector_store = None
@@ -107,8 +109,8 @@ class LlmSqlToFhirPipeline:
 
     def run(
         self,
-        subject_id: int,
-        admission_id: int | None = None,
+        subject_id: int | str,
+        admission_id: int | str | None = None,
     ) -> LlmFhirPipelineResult:
         generated: list[dict[str, Any]] = []
         traces: list[LlmQueryTrace] = []
@@ -117,7 +119,7 @@ class LlmSqlToFhirPipeline:
         generation_metrics: dict[str, dict[str, int | float]] = {}
         source_rows: dict[str, list[dict[str, Any]]] = {}
         generated_by_type: dict[str, list[dict[str, Any]]] = {}
-        admission_ids: list[int] = []
+        admission_ids: list[int | str] = []
         total_calls = 0
 
         try:
@@ -152,7 +154,9 @@ class LlmSqlToFhirPipeline:
         finally:
             self.query_service.close()
 
-        bundle = build_bundle(generated)
+        bundle = build_bundle(
+            generated, namespace=self.profile.bundle_namespace
+        )
         report = validate_bundle_detailed(bundle, self.settings)
         task_evaluation = evaluate_task_output(
             self.mapping,

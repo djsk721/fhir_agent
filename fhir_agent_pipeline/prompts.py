@@ -23,7 +23,7 @@ Source rows from LLM-generated, read-only SQL:
 Required ID and reference contract:
 {identity_contract}
 
-FHIR R4 and MIMIC mapping context retrieved from VectorDB:
+FHIR R4 and source mapping context retrieved from VectorDB:
 {fhir_context}
 
 {correction_context}

@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import gzip
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable, Iterator
+from urllib.parse import quote, unquote
 
 from .config import Settings
 from .json_utils import dump_json
@@ -13,13 +15,14 @@ from .performance import (
     aggregate_performance_metrics,
     build_performance_metrics,
 )
+from .source_profile import SourceProfile
 from .validation import validate_bundle_detailed
 
 
 @dataclass(frozen=True)
 class ExportRequest:
     output_directory: Path
-    subject_ids: tuple[int, ...] = ()
+    subject_ids: tuple[int | str, ...] = ()
     limit: int | None = None
     all_demo_patients: bool = False
     resume: bool = False
@@ -36,58 +39,87 @@ class ExportRequest:
             raise ValueError("limit은 1 이상이어야 합니다.")
 
 
-def resolve_demo_patient_file(root: Path) -> Path:
-    """demo 루트 또는 버전 상위 루트에서 Patient NDJSON gzip을 찾습니다."""
+def resolve_cohort_patient_file(settings: Settings) -> Path:
+    """선택한 source profile의 패턴으로 cohort Patient 파일을 찾습니다."""
 
-    candidates = [
-        root / "MimicPatient.ndjson.gz",
-        root / "fhir" / "MimicPatient.ndjson.gz",
-        *root.glob("*/fhir/MimicPatient.ndjson.gz"),
-    ]
-    available = [path for path in candidates if path.is_file()]
+    profile = SourceProfile.load(settings.source_profile_path)
+    candidates: list[Path] = []
+    for pattern in profile.cohort.patient_file_patterns:
+        candidates.extend(settings.source_data_path.glob(pattern))
+    available = sorted({path.resolve() for path in candidates if path.is_file()})
     if not available:
         raise FileNotFoundError(
-            f"demo Patient NDJSON을 찾을 수 없습니다: {root}"
+            f"{profile.name} cohort Patient 파일을 찾을 수 없습니다: "
+            f"{settings.source_data_path}"
+        )
+    def natural_key(path: Path) -> tuple[tuple[int, int | str], ...]:
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part.lower())
+            for part in re.split(r"(\d+)", str(path))
+            if part
         )
 
-    def version_key(path: Path) -> tuple[int, ...]:
-        version = path.parent.parent.name if path.parent.name == "fhir" else "0"
-        try:
-            return tuple(int(part) for part in version.split("."))
-        except ValueError:
-            return (0,)
-
-    return max(available, key=version_key)
+    return max(available, key=natural_key)
 
 
-def _demo_subject_id(resource: dict[str, Any], path: Path, line_number: int) -> int:
+def _cohort_patient_key(
+    resource: dict[str, Any],
+    path: Path,
+    line_number: int,
+    *,
+    identifier_system: str | None = None,
+    key_type: str = "integer",
+) -> int | str:
     if resource.get("resourceType") != "Patient":
         raise ValueError(f"{path.name}:{line_number}은 Patient 리소스가 아닙니다.")
     identifiers = resource.get("identifier", [])
-    numeric_values: set[int] = set()
+    values: set[int | str] = set()
+    fallback_values: set[int | str] = set()
     for identifier in identifiers if isinstance(identifiers, list) else []:
         if not isinstance(identifier, dict):
             continue
         raw_value = str(identifier.get("value", "")).strip()
-        if raw_value.isdigit():
-            numeric_values.add(int(raw_value))
-    if len(numeric_values) != 1:
+        if not raw_value:
+            continue
+        if key_type == "integer":
+            try:
+                normalized_value: int | str = int(raw_value)
+            except ValueError:
+                continue
+        else:
+            normalized_value = raw_value
+        fallback_values.add(normalized_value)
+        if not identifier_system or identifier.get("system") == identifier_system:
+            values.add(normalized_value)
+    # system 없는 과거 demo/test 파일은 단일 후보일 때만 호환 처리합니다.
+    if not values and len(fallback_values) == 1:
+        values = fallback_values
+    if len(values) != 1:
         raise ValueError(
-            f"{path.name}:{line_number}에서 DB subject_id 숫자 identifier를 "
-            f"하나로 결정할 수 없습니다: {sorted(numeric_values)}"
+            f"{path.name}:{line_number}에서 DB 환자 키 identifier를 "
+            f"하나로 결정할 수 없습니다: {sorted(str(value) for value in values)}"
         )
-    return numeric_values.pop()
+    return values.pop()
 
 
-def iter_demo_subject_ids(settings: Settings, limit: int | None) -> Iterator[int]:
+def iter_cohort_patient_ids(
+    settings: Settings, limit: int | None
+) -> Iterator[int | str]:
     """demo Patient NDJSON의 identifier.value에서 DB subject_id를 읽습니다."""
 
     if limit is not None and limit < 1:
         raise ValueError("limit은 1 이상이어야 합니다.")
-    path = resolve_demo_patient_file(settings.mimic_fhir_demo_path)
-    seen: set[int] = set()
+    profile = SourceProfile.load(settings.source_profile_path)
+    if profile.cohort.provider != "fhir-patient-ndjson":
+        raise ValueError(
+            f"{profile.name} profile은 --limit/--all cohort provider를 "
+            f"지원하지 않습니다: {profile.cohort.provider}"
+        )
+    path = resolve_cohort_patient_file(settings)
+    seen: set[int | str] = set()
     yielded = 0
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
                 continue
@@ -97,7 +129,13 @@ def iter_demo_subject_ids(settings: Settings, limit: int | None) -> Iterator[int
                 raise ValueError(
                     f"{path.name}:{line_number} JSON 파싱 실패: {exc}"
                 ) from exc
-            subject_id = _demo_subject_id(resource, path, line_number)
+            subject_id = _cohort_patient_key(
+                resource,
+                path,
+                line_number,
+                identifier_system=profile.cohort.identifier_system,
+                key_type=profile.cohort.key_type,
+            )
             if subject_id in seen:
                 raise ValueError(
                     f"{path.name}:{line_number} subject_id가 중복됐습니다: {subject_id}"
@@ -109,8 +147,11 @@ def iter_demo_subject_ids(settings: Settings, limit: int | None) -> Iterator[int
                 return
 
 
-def _paths(output_directory: Path, subject_id: int) -> tuple[Path, Path]:
-    stem = output_directory / f"subject-{subject_id}"
+def _paths(
+    output_directory: Path, subject_id: int | str
+) -> tuple[Path, Path]:
+    safe_key = quote(str(subject_id), safe="")
+    stem = output_directory / f"subject-{safe_key}"
     return stem.with_suffix(".bundle.json"), stem.with_suffix(".validation.json")
 
 
@@ -191,10 +232,10 @@ class FhirBatchExportService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def _subject_ids(self, request: ExportRequest) -> Iterable[int]:
+    def _subject_ids(self, request: ExportRequest) -> Iterable[int | str]:
         if request.subject_ids:
             return request.subject_ids
-        return iter_demo_subject_ids(
+        return iter_cohort_patient_ids(
             self._settings,
             limit=None if request.all_demo_patients else request.limit,
         )
@@ -212,9 +253,9 @@ class FhirBatchExportService:
             }
             if request.subject_ids
             else {
-                "source": "mimic-fhir-demo-patient-ndjson",
+                "source": "source-profile-fhir-patient-ndjson",
                 "patient_file": str(
-                    resolve_demo_patient_file(self._settings.mimic_fhir_demo_path)
+                    resolve_cohort_patient_file(self._settings)
                 ),
                 "limit": None if request.all_demo_patients else request.limit,
             }
@@ -303,8 +344,10 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
     output_directory = directory.resolve()
     records: list[dict[str, Any]] = []
     for bundle_path in sorted(output_directory.glob("subject-*.bundle.json")):
-        subject_text = bundle_path.name.removeprefix("subject-").removesuffix(
-            ".bundle.json"
+        subject_text = unquote(
+            bundle_path.name.removeprefix("subject-").removesuffix(
+                ".bundle.json"
+            )
         )
         validation_path = bundle_path.with_name(
             bundle_path.name.replace(".bundle.json", ".validation.json")
@@ -328,7 +371,7 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
             _write_json_atomic(validation_path, report)
             records.append(
                 {
-                    "subject_id": int(subject_text),
+                    "subject_id": subject_text,
                     "status": "valid" if report["valid"] else "invalid",
                     "resumed": False,
                     "bundle": str(bundle_path),

@@ -7,6 +7,8 @@ import re
 
 from dotenv import load_dotenv
 
+from .source_profile import SourceProfile
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -27,7 +29,7 @@ class Settings:
     mimic_procedure_dictionary_table: str
     allowed_schemas: tuple[str, ...]
     allowed_tables: tuple[str, ...]
-    patient_subject_id: int | None
+    patient_subject_id: int | str | None
     ollama_base_url: str
     ollama_model: str
     ollama_embedding_model: str
@@ -64,6 +66,38 @@ class Settings:
     fhir_validator_timeout_seconds: int
     fhir_validator_max_output_chars: int
     vector_batch_size: int
+    source_profile_path: Path
+
+    @property
+    def source_db_url(self) -> str:
+        return self.mimic_db_url
+
+    @property
+    def source_data_path(self) -> Path:
+        return self.mimic_fhir_demo_path
+
+    @property
+    def source_schema(self) -> str:
+        return self.mimic_schema
+
+    @property
+    def source_mapping_config_path(self) -> Path:
+        return self.mimic_mapping_config_path
+
+    def source_table(self, role: str) -> str:
+        tables = {
+            "patient": self.mimic_patients_table,
+            "encounter": self.mimic_admissions_table,
+            "observation": self.mimic_labevents_table,
+            "condition": self.mimic_diagnoses_table,
+            "condition_dictionary": self.mimic_diagnosis_dictionary_table,
+            "procedure": self.mimic_procedures_table,
+            "procedure_dictionary": self.mimic_procedure_dictionary_table,
+        }
+        try:
+            return tables[role]
+        except KeyError as exc:
+            raise ValueError(f"알 수 없는 원천 테이블 역할: {role}") from exc
 
 
 def _csv(raw: str, default: list[str]) -> list[str]:
@@ -90,6 +124,14 @@ def _integer(name: str, default: int) -> int:
         raise ValueError(f"{name}은 정수여야 합니다: {raw!r}") from exc
 
 
+def _integer_alias(generic_name: str, legacy_name: str, default: int) -> int:
+    raw = os.getenv(generic_name)
+    return _integer(
+        generic_name if raw is not None else legacy_name,
+        default,
+    )
+
+
 def _validate_settings(settings: Settings) -> None:
     bounded_values = {
         "EMBEDDING_DIMENSION": (settings.embedding_dimension, 1, None),
@@ -97,18 +139,18 @@ def _validate_settings(settings: Settings) -> None:
         "SQL_MAX_ROWS": (settings.sql_max_rows, 1, 10_000),
         "SQL_STATEMENT_TIMEOUT_MS": (settings.sql_statement_timeout_ms, 1, None),
         "DB_CONNECT_TIMEOUT_SECONDS": (settings.db_connect_timeout_seconds, 1, None),
-        "MIMIC_MAX_ENCOUNTERS": (settings.max_encounters, 1, 100),
-        "MIMIC_MAX_OBSERVATIONS_PER_ENCOUNTER": (
+        "SOURCE_MAX_ENCOUNTERS": (settings.max_encounters, 1, 100),
+        "SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER": (
             settings.max_observations_per_encounter,
             1,
             10_000,
         ),
-        "MIMIC_MAX_CONDITIONS_PER_ENCOUNTER": (
+        "SOURCE_MAX_CONDITIONS_PER_ENCOUNTER": (
             settings.max_conditions_per_encounter,
             1,
             10_000,
         ),
-        "MIMIC_MAX_PROCEDURES_PER_ENCOUNTER": (
+        "SOURCE_MAX_PROCEDURES_PER_ENCOUNTER": (
             settings.max_procedures_per_encounter,
             1,
             10_000,
@@ -171,34 +213,76 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
     """설정을 로드하고 사람이 이해하기 쉬운 오류로 잘못된 값을 차단합니다."""
 
     load_dotenv(dotenv_path=env_file or PROJECT_ROOT / ".env", override=False)
-    mimic_db_url = os.getenv("MIMIC_DB_URL", "").strip()
-    if require_database and not mimic_db_url:
-        raise ValueError("MIMIC_DB_URL이 필요합니다. `.env.example`을 `.env`로 복사하세요.")
+    source_profile_path = _path(
+        "SOURCE_PROFILE_PATH",
+        PROJECT_ROOT / "profiles" / "mimic_iv" / "profile.json",
+    )
+    profile = SourceProfile.load(source_profile_path)
+    is_mimic_profile = profile.name.lower().startswith("mimic")
 
-    schema = os.getenv("MIMIC_SCHEMA", "mimiciv_hosp").strip() or "mimiciv_hosp"
-    patients = os.getenv("MIMIC_PATIENTS_TABLE", "patients").strip() or "patients"
-    admissions = os.getenv("MIMIC_ADMISSIONS_TABLE", "admissions").strip() or "admissions"
-    labevents = os.getenv("MIMIC_LABEVENTS_TABLE", "labevents").strip() or "labevents"
-    diagnoses = os.getenv("MIMIC_DIAGNOSES_TABLE", "diagnoses_icd").strip() or "diagnoses_icd"
-    diagnosis_dictionary = (
-        os.getenv("MIMIC_DIAGNOSIS_DICTIONARY_TABLE", "d_icd_diagnoses").strip()
-        or "d_icd_diagnoses"
+    def profile_value(
+        generic_name: str, legacy_name: str, default: str
+    ) -> str:
+        value = os.getenv(generic_name, "").strip()
+        if not value and is_mimic_profile:
+            value = os.getenv(legacy_name, "").strip()
+        return value or default
+
+    mimic_db_url = profile_value("SOURCE_DB_URL", "MIMIC_DB_URL", "")
+    if require_database and not mimic_db_url:
+        raise ValueError(
+            "SOURCE_DB_URL이 필요합니다. 기존 MIMIC profile은 MIMIC_DB_URL도 지원합니다."
+        )
+
+    schema = profile_value("SOURCE_SCHEMA", "MIMIC_SCHEMA", profile.database_schema)
+    patients = profile_value(
+        "SOURCE_PATIENT_TABLE", "MIMIC_PATIENTS_TABLE", profile.table("patient")
     )
-    procedures = os.getenv("MIMIC_PROCEDURES_TABLE", "procedures_icd").strip() or "procedures_icd"
-    procedure_dictionary = (
-        os.getenv("MIMIC_PROCEDURE_DICTIONARY_TABLE", "d_icd_procedures").strip()
-        or "d_icd_procedures"
+    admissions = profile_value(
+        "SOURCE_ENCOUNTER_TABLE",
+        "MIMIC_ADMISSIONS_TABLE",
+        profile.table("encounter"),
     )
-    subject_raw = os.getenv("PATIENT_SUBJECT_ID", "").strip()
+    labevents = profile_value(
+        "SOURCE_OBSERVATION_TABLE",
+        "MIMIC_LABEVENTS_TABLE",
+        profile.table("observation"),
+    )
+    diagnoses = profile_value(
+        "SOURCE_CONDITION_TABLE",
+        "MIMIC_DIAGNOSES_TABLE",
+        profile.table("condition"),
+    )
+    diagnosis_dictionary = profile_value(
+        "SOURCE_CONDITION_DICTIONARY_TABLE",
+        "MIMIC_DIAGNOSIS_DICTIONARY_TABLE",
+        profile.table("condition_dictionary"),
+    )
+    procedures = profile_value(
+        "SOURCE_PROCEDURE_TABLE",
+        "MIMIC_PROCEDURES_TABLE",
+        profile.table("procedure"),
+    )
+    procedure_dictionary = profile_value(
+        "SOURCE_PROCEDURE_DICTIONARY_TABLE",
+        "MIMIC_PROCEDURE_DICTIONARY_TABLE",
+        profile.table("procedure_dictionary"),
+    )
+    subject_raw = os.getenv(
+        "SOURCE_PATIENT_ID", os.getenv("PATIENT_SUBJECT_ID", "")
+    ).strip()
     validator_raw = os.getenv("FHIR_VALIDATOR_JAR", "").strip()
     resources_raw = os.getenv("FHIR_OUTPUT_RESOURCES", "").strip()
 
     settings = Settings(
         mimic_db_url=mimic_db_url,
-        mimic_fhir_demo_path=_path(
-            "MIMIC_FHIR_DATA_PATH",
-            PROJECT_ROOT / "data" / "mimic-iv-fhir-demo",
-        ),
+        mimic_fhir_demo_path=Path(
+            profile_value(
+                "SOURCE_DATA_PATH",
+                "MIMIC_FHIR_DATA_PATH",
+                str(PROJECT_ROOT / "data" / profile.name),
+            )
+        ).expanduser().resolve(),
         mimic_schema=schema,
         mimic_patients_table=patients,
         mimic_admissions_table=admissions,
@@ -228,7 +312,15 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
                 ],
             )
         ),
-        patient_subject_id=int(subject_raw) if subject_raw else None,
+        patient_subject_id=(
+            (
+                int(subject_raw)
+                if profile.cohort.key_type == "integer"
+                else subject_raw
+            )
+            if subject_raw
+            else None
+        ),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip(),
         ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e4b").strip(),
         ollama_embedding_model=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text").strip(),
@@ -251,15 +343,23 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
         sql_max_rows=_integer("SQL_MAX_ROWS", 100),
         sql_statement_timeout_ms=_integer("SQL_STATEMENT_TIMEOUT_MS", 15_000),
         db_connect_timeout_seconds=_integer("DB_CONNECT_TIMEOUT_SECONDS", 5),
-        max_encounters=_integer("MIMIC_MAX_ENCOUNTERS", 1),
-        max_observations_per_encounter=_integer(
-            "MIMIC_MAX_OBSERVATIONS_PER_ENCOUNTER", 10
+        max_encounters=_integer_alias(
+            "SOURCE_MAX_ENCOUNTERS", "MIMIC_MAX_ENCOUNTERS", 1
         ),
-        max_conditions_per_encounter=_integer(
-            "MIMIC_MAX_CONDITIONS_PER_ENCOUNTER", 10
+        max_observations_per_encounter=_integer_alias(
+            "SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER",
+            "MIMIC_MAX_OBSERVATIONS_PER_ENCOUNTER",
+            10,
         ),
-        max_procedures_per_encounter=_integer(
-            "MIMIC_MAX_PROCEDURES_PER_ENCOUNTER", 10
+        max_conditions_per_encounter=_integer_alias(
+            "SOURCE_MAX_CONDITIONS_PER_ENCOUNTER",
+            "MIMIC_MAX_CONDITIONS_PER_ENCOUNTER",
+            10,
+        ),
+        max_procedures_per_encounter=_integer_alias(
+            "SOURCE_MAX_PROCEDURES_PER_ENCOUNTER",
+            "MIMIC_MAX_PROCEDURES_PER_ENCOUNTER",
+            10,
         ),
         fhir_output_resources=_csv(
             resources_raw,
@@ -270,10 +370,13 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
         fhir_export_directory=_path(
             "FHIR_EXPORT_DIR", PROJECT_ROOT / "fhir_export"
         ),
-        mimic_mapping_config_path=_path(
-            "MIMIC_MAPPING_CONFIG",
-            PROJECT_ROOT / "db" / "mimic_mapping_config.json",
-        ),
+        mimic_mapping_config_path=Path(
+            profile_value(
+                "SOURCE_MAPPING_CONFIG",
+                "MIMIC_MAPPING_CONFIG",
+                str(profile.mapping_path),
+            )
+        ).expanduser().resolve(),
         fhir_default_timezone=os.getenv("FHIR_DEFAULT_TIMEZONE", "Z").strip() or "Z",
         fhir_version=os.getenv("FHIR_VERSION", "4.0.1").strip() or "4.0.1",
         fhir_validator_timeout_seconds=_integer("FHIR_VALIDATOR_TIMEOUT_SECONDS", 120),
@@ -281,6 +384,7 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
             "FHIR_VALIDATOR_MAX_OUTPUT_CHARS", 10_000
         ),
         vector_batch_size=_integer("VECTOR_BATCH_SIZE", 64),
+        source_profile_path=source_profile_path,
     )
     _validate_settings(settings)
     return settings

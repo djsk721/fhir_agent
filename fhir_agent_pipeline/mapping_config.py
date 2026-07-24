@@ -11,6 +11,20 @@ from typing import Any
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _terminology_systems(
+    terminology: dict[str, Any], resource_name: str
+) -> dict[int, str]:
+    """새 범용 형식과 기존 MIMIC 형식을 모두 읽습니다."""
+
+    generic = terminology.get(f"{resource_name}_systems")
+    if generic:
+        return {int(version): str(system) for version, system in generic.items()}
+    return {
+        9: str(terminology[f"{resource_name}_icd9_system"]),
+        10: str(terminology[f"{resource_name}_icd10_system"]),
+    }
+
+
 @dataclass(frozen=True)
 class TableColumns:
     values: dict[str, str]
@@ -23,7 +37,7 @@ class TableColumns:
 
 
 @dataclass(frozen=True)
-class MimicMappingConfig:
+class SourceMappingConfig:
     patient_columns: TableColumns
     admission_columns: TableColumns
     lab_columns: TableColumns
@@ -53,9 +67,9 @@ class MimicMappingConfig:
     source_path: Path
 
     @classmethod
-    def load(cls, path: Path) -> "MimicMappingConfig":
+    def load(cls, path: Path) -> "SourceMappingConfig":
         if not path.is_file():
-            raise FileNotFoundError(f"MIMIC_MAPPING_CONFIG 파일을 찾을 수 없습니다: {path}")
+            raise FileNotFoundError(f"원천 매핑 설정 파일을 찾을 수 없습니다: {path}")
         with path.open(encoding="utf-8") as handle:
             payload: dict[str, Any] = json.load(handle)
         columns = payload["source_columns"]
@@ -94,14 +108,8 @@ class MimicMappingConfig:
                 str(key).lower(): dict(value)
                 for key, value in resource_ids.items()
             },
-            diagnosis_icd_systems={
-                9: str(terminology["diagnosis_icd9_system"]),
-                10: str(terminology["diagnosis_icd10_system"]),
-            },
-            procedure_icd_systems={
-                9: str(terminology["procedure_icd9_system"]),
-                10: str(terminology["procedure_icd10_system"]),
-            },
+            diagnosis_icd_systems=_terminology_systems(terminology, "diagnosis"),
+            procedure_icd_systems=_terminology_systems(terminology, "procedure"),
             diagnosis_decimal_positions={
                 int(key): (int(value) if value is not None else None)
                 for key, value in terminology["diagnosis_decimal_positions"].items()
@@ -412,3 +420,7 @@ class MimicMappingConfig:
         unit = str(display_unit or "").strip()
         rules = self.fhir_defaults.get("ucum_code_map", {})
         return str(rules.get(unit, unit))
+
+
+# 이전 import를 사용하는 외부 코드와 테스트를 위한 호환 별칭입니다.
+MimicMappingConfig = SourceMappingConfig

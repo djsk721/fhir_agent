@@ -1,7 +1,8 @@
-# MIMIC-IV DB → LLM → FHIR
+# 임상 DB → LLM → FHIR
 
-이 프로젝트의 단일 목적은 별도 PostgreSQL 서버의 MIMIC-IV 데이터를 LLM으로 조회하고,
-조회 결과를 FHIR R4 리소스로 변환한 뒤 검증하는 것입니다.
+이 프로젝트는 별도 PostgreSQL 서버의 임상 데이터를 LLM으로 조회하고, 조회 결과를
+FHIR R4 리소스로 변환한 뒤 검증합니다. 기본 제공 source profile은 MIMIC-IV 2.2이며,
+병원별 DB 구조와 매핑은 Pipeline 코드가 아니라 프로필 파일로 교체할 수 있습니다.
 
 지원 리소스는 `Patient`, `Encounter`, `Condition`, `Procedure`, `Observation`입니다.
 
@@ -25,13 +26,35 @@ DB Schema + FHIR Schema/매핑
 결정적 Builder, Mapping Advisor, 기존 FHIR NDJSON benchmark 경로는 제거했습니다.
 `convert`와 `export-validate`는 모두 같은 `LlmSqlToFhirPipeline`을 사용합니다.
 
+## Source profile: 타 병원 DB 적용
+
+MIMIC 전용 정책은 [MIMIC source profile](./profiles/mimic_iv/profile.json)에 모았습니다.
+
+- `profile.json`: DB schema, 테이블 역할, 매핑·SQL 템플릿 경로, Bundle namespace, cohort 추출 정책
+- `queries.json`: 리소스별 LLM SQL 질문 템플릿
+- `mapping JSON`: 논리 필드→물리 컬럼, 식별자, ID, 성별, Encounter, ICD/UCUM 정책
+
+Pipeline, LLM 생성, Bundle 조립, 검증 코드는 `patient`, `encounter`, `condition`,
+`procedure`, `observation`이라는 논리 역할만 사용합니다. 따라서 타 병원 적용 시
+[hospital_sample 예시](./profiles/hospital_sample/profile.json)를 복사해 세 파일의
+물리 schema·테이블·컬럼과 용어 정책을 바꾸고 다음 한 줄만 지정하면 됩니다.
+
+```dotenv
+SOURCE_PROFILE_PATH=./profiles/my_hospital/profile.json
+```
+
+프로필을 바꾸면 VectorDB 문서 내용도 달라지므로 반드시 `build-vectors`를 다시 실행합니다.
+`SQL_ALLOWED_SCHEMAS`와 `SQL_ALLOWED_TABLES`도 새 DB의 최소 허용 범위로 맞춰야 합니다.
+현재 공통 Pipeline이 지원하는 FHIR 리소스는 5종이며, 새 리소스를 추가하려면 공통
+`ResourceAdapter`와 해당 프로필의 query/mapping 계약을 함께 추가해야 합니다.
+
 ## 현재 구현 내용
 
 ### 핵심 실행 경로
 
 `LlmSqlToFhirPipeline.run()`은 다음 순서로 동작합니다.
 
-1. `.env`와 `db/mimic_mapping_config.json`을 읽고 설정값·리소스 의존성을 검사합니다.
+1. `.env`, source profile과 mapping JSON을 읽고 설정값·리소스 의존성을 검사합니다.
 2. SQL/FHIR Vector 테이블의 존재 여부, 필수 컬럼, 행 수를 검사합니다.
 3. `ResourceAdapter` 순서에 따라 Patient → Encounter → Condition → Procedure → Observation을 처리합니다.
 4. SQL VectorDB 문맥으로 리소스별 PostgreSQL `SELECT`를 생성합니다.
@@ -74,7 +97,7 @@ Medication 관련 리소스는 후속 확장 대상으로 둡니다. MIMIC-IV의
 `MedicationAdministration`, `MedicationDispense` 등으로 목적별 모델이 나뉩니다. 약물명,
 용량, 단위, 경로와 RxNorm 표준화 기준을 먼저 정의해야 하므로 초기 검증 범위에서는 제외했습니다.
 
-실제 테이블명과 컬럼명은 `.env` 및 매핑 JSON에서 변경할 수 있습니다. ID는 코드에서 문자열을
+실제 테이블명과 컬럼명은 source profile 및 매핑 JSON에서 변경할 수 있습니다. ID는 코드에서 문자열을
 조합하지 않고 `resource_ids`의 `template` 또는 `candidates` 정책으로 생성합니다.
 
 ### LLM SQL 생성과 안전 실행
@@ -149,15 +172,15 @@ ollama pull nomic-embed-text
 먼저 다음 값을 실제 환경에 맞게 수정합니다.
 
 ```dotenv
-MIMIC_DB_URL=postgresql+psycopg2://사용자:비밀번호@DB서버:5432/mimiciv-2.2
+SOURCE_PROFILE_PATH=./profiles/mimic_iv/profile.json
+SOURCE_DB_URL=postgresql+psycopg2://사용자:비밀번호@DB서버:5432/mimiciv-2.2
+SOURCE_DATA_PATH=/home/mdhi/physionet.org/files/mimic-iv-fhir-demo
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=gemma4:e4b
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 EMBEDDING_DIMENSION=768
 
 FHIR_SCHEMA_PATH=./db/fhir.schema.json
-MIMIC_MAPPING_CONFIG=./db/mimic_mapping_config.json
-MIMIC_FHIR_DATA_PATH=/home/mdhi/physionet.org/files/mimic-iv-fhir-demo
 FHIR_DEFAULT_TIMEZONE=Z
 ```
 
@@ -165,12 +188,12 @@ FHIR_DEFAULT_TIMEZONE=Z
 
 | 설정 | 의미 | 예시 |
 |---|---|---:|
-| `PATIENT_SUBJECT_ID` | 명령행에서 생략할 기본 환자 ID | 빈 값 |
+| `SOURCE_PATIENT_ID` | 명령행에서 생략할 기본 환자 ID | 빈 값 |
 | `FHIR_OUTPUT_RESOURCES` | 생성할 리소스 | 5종 전체 |
-| `MIMIC_MAX_ENCOUNTERS` | 환자당 최근 입원 수 | `1` |
-| `MIMIC_MAX_CONDITIONS_PER_ENCOUNTER` | 입원당 진단 수 | `10` |
-| `MIMIC_MAX_PROCEDURES_PER_ENCOUNTER` | 입원당 처치 수 | `10` |
-| `MIMIC_MAX_OBSERVATIONS_PER_ENCOUNTER` | 입원당 검사 수 | `10` |
+| `SOURCE_MAX_ENCOUNTERS` | 환자당 최근 입원 수 | `1` |
+| `SOURCE_MAX_CONDITIONS_PER_ENCOUNTER` | 입원당 진단 수 | `10` |
+| `SOURCE_MAX_PROCEDURES_PER_ENCOUNTER` | 입원당 처치 수 | `10` |
+| `SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER` | 입원당 검사 수 | `10` |
 | `SQL_MAX_ROWS` | 안전 Gateway의 최종 행 제한 | `100` |
 | `LLM_SQL_MAX_ATTEMPTS` | SQL 자동 교정 포함 최대 호출 | `2` |
 | `LLM_FHIR_MAX_ATTEMPTS` | FHIR 배치 자동 교정 포함 최대 호출 | `2` |
@@ -178,8 +201,9 @@ FHIR_DEFAULT_TIMEZONE=Z
 | `LLM_FHIR_CONTEXT_SEARCH_K` | FHIR Vector 문맥 수 | `20` |
 | `FHIR_VALIDATOR_JAR` | HL7 Validator CLI jar | 선택 사항 |
 
-소스 컬럼, 성별, Encounter class/status, ID 생성, ICD와 UCUM 규칙은
+MIMIC의 소스 컬럼, 성별, Encounter class/status, ID 생성, ICD와 UCUM 규칙은
 [mimic_mapping_config.json](./db/mimic_mapping_config.json)에서 변경합니다.
+기존 `MIMIC_*` 환경 변수는 기본 MIMIC profile에서 하위 호환됩니다.
 
 ## 실행
 
@@ -200,7 +224,7 @@ python main.py inspect-vectors
 
 | 기본 테이블 | 내용 |
 |---|---|
-| `public.fhir_mapping_vectors` | FHIR R4 JSON Schema와 MIMIC→FHIR 매핑 정책 |
+| `public.fhir_mapping_vectors` | FHIR R4 JSON Schema와 선택한 source→FHIR 매핑 정책 |
 | `public.mimic_sql_schema_vectors` | 허용된 실제 DB 테이블·컬럼·PK·FK |
 
 문서 `content_hash`가 바뀐 항목만 다시 임베딩하며 cosine 검색용 HNSW 인덱스를 만듭니다.
@@ -222,10 +246,11 @@ LLM SQL은 실행 전에 다음 정책을 통과해야 합니다.
 ### 4. 환자 한 명 변환 및 검증
 
 ```bash
-python main.py convert --subject-id 10000032 --hadm-id 25742920
+python main.py convert --subject-id 10000032 --encounter-id 25742920
 ```
 
-`--hadm-id`는 선택 사항입니다. 생략하면 설정된 개수만큼 최근 입원을 조회합니다.
+`--encounter-id`는 선택 사항입니다. 생략하면 설정된 개수만큼 최근 입원을 조회합니다.
+기존 `--hadm-id`도 호환 별칭으로 동작합니다.
 
 생성 파일:
 
@@ -250,9 +275,10 @@ python main.py export-validate --limit 10 --resume
 python main.py export-validate --all --resume
 ```
 
-`--limit`과 `--all`의 환자 목록은 DB 전체 환자가 아니라 `MIMIC_FHIR_DATA_PATH` 아래
-최신 버전의 `fhir/MimicPatient.ndjson.gz`에서 읽습니다. demo Patient의 FHIR `id`는 UUID이므로
-DB 조회에는 `identifier[].value`의 숫자 `subject_id`를 사용합니다.
+`--limit`과 `--all`의 환자 목록은 DB 전체 환자가 아니라 선택한 source profile의
+`cohort.patient_file_patterns`에 해당하는 `SOURCE_DATA_PATH` 아래 Patient NDJSON에서 읽습니다.
+기본 MIMIC profile은 최신 `fhir/MimicPatient.ndjson.gz`를 선택하고, profile에 지정된
+`identifier_system`의 `identifier[].value`를 DB 환자 키로 사용합니다.
 
 - `--limit 10`: demo Patient NDJSON 순서의 앞 10명을 DB→LLM→FHIR로 변환
 - `--all`: demo Patient NDJSON에 포함된 모든 환자를 변환
@@ -352,6 +378,24 @@ python main.py compare-rag \
 
 매핑 계약에 포함되지 않은 최상위 필드 목록은 코드에 중복 선언하지 않고
 `db/mimic_mapping_config.json`의 `evaluation.allowed_top_level_fields`에서 관리합니다.
+
+## Source profile 리팩토링 검증
+
+2026-07-24 기본 MIMIC profile로 VectorDB를 다시 구축하고 demo 환자 `10007928`을
+DB→LLM SQL→LLM FHIR→검증까지 실행했습니다.
+
+- VectorDB: FHIR 문서 11,503건, SQL 문서 10건, 두 테이블 모두 `vector(768)`·HNSW 호환
+- 조회 행: Patient 1, Encounter 1, Condition 10, Procedure 1, Observation 10
+- 생성 결과: 23개 리소스, 누락·과생성 0건
+- FHIR Validator: 통과, fatal/error 0건, warning 56건
+- Source Field Accuracy, Resource Count Alignment, Condition/Procedure/Observation F1,
+  Reference Resolution, Coding Accuracy: 모두 `1.0`
+- 자동 교정: 13개 배치, first-pass `53.85%`, repair 6회, Repair Success Rate `100%`
+- 저장된 `fhir_output/bundle.json` 독립 재검증: 통과
+
+이 실행은 source profile 분리 후에도 기본 MIMIC 동작이 유지되는지 확인한 smoke test입니다.
+타 병원 예시 프로필은 DB 접속 정보가 없는 구조 예시이므로 물리 SQL 질문 생성까지 회귀
+테스트하며, 실제 병원 DB end-to-end 결과를 의미하지 않습니다.
 
 ## 100명 전체 cohort 실행 결과
 
@@ -494,6 +538,7 @@ Observation 교정에 최종 실패한 32명의 telemetry는 집계되지 않으
 main.py                                  CLI 진입점
 fhir_agent_pipeline/cli.py               명령 파싱과 결과 저장
 fhir_agent_pipeline/config.py            .env 설정과 범위 검증
+fhir_agent_pipeline/source_profile.py    병원별 DB·query·cohort profile 로더
 fhir_agent_pipeline/db.py                DB 엔진과 안전한 PostgreSQL 식별자
 fhir_agent_pipeline/vector_store.py      FHIR/SQL pgvector 구축과 검색
 fhir_agent_pipeline/sql_agent.py         LLM SQL 생성과 읽기 전용 Gateway
@@ -508,5 +553,7 @@ fhir_agent_pipeline/evaluation.py        DB 원본 충실도·리소스 F1·참�
 fhir_agent_pipeline/performance.py       대표 지표 통합·cohort 집계·RAG 비교
 fhir_agent_pipeline/export_service.py    demo cohort 선택과 동일 LLM Pipeline의 다환자 실행
 db/mimic_mapping_config.json             외부 매핑 정책
+profiles/mimic_iv/                       기본 MIMIC source/query profile
+profiles/hospital_sample/                타 병원 물리 schema·컬럼 교체 예시
 tests/                                   DB/Ollama 없이 실행하는 회귀 테스트
 ```

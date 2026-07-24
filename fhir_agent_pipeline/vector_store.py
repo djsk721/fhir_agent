@@ -11,8 +11,9 @@ from .config import Settings
 from .db import build_engine, quote_identifier
 from .fhir_schema import get_fhir_schema
 from .json_utils import dump_json
-from .mapping_config import MimicMappingConfig
+from .mapping_config import SourceMappingConfig
 from .ollama import OllamaClient
+from .source_profile import SourceProfile
 
 
 def _vector_literal(vector: list[float]) -> str:
@@ -336,7 +337,8 @@ def database_schema_documents(settings: Settings, engine: Engine | None = None) 
 
 
 def mapping_profile_documents(settings: Settings) -> list[KnowledgeDocument]:
-    mapping = MimicMappingConfig.load(settings.mimic_mapping_config_path)
+    profile = SourceProfile.load(settings.source_profile_path)
+    mapping = SourceMappingConfig.load(settings.source_mapping_config_path)
     source_columns = {
         "patient": mapping.patient_columns.values,
         "admission": mapping.admission_columns.values,
@@ -371,23 +373,31 @@ def mapping_profile_documents(settings: Settings) -> list[KnowledgeDocument]:
         "procedure_prefix_decimal_positions": mapping.procedure_prefix_decimal_positions,
         "fhir_defaults": mapping.fhir_defaults,
     }
-    common = {"source": str(mapping.source_path), "kind": "mimic_mapping_profile"}
+    label = profile.name
+    common = {
+        "source": str(mapping.source_path),
+        "profile": label,
+        "kind": "source_mapping_profile",
+    }
     return [
         KnowledgeDocument(
-            "MIMIC logical-to-physical source columns:\n" + dump_json(source_columns),
+            f"{label} logical-to-physical source columns:\n"
+            + dump_json(source_columns),
             {**common, "section": "source_columns"},
         ),
         KnowledgeDocument(
-            "MIMIC admission_type to FHIR Encounter mapping:\n"
+            f"{label} encounter source to FHIR Encounter mapping:\n"
             + dump_json(encounter_rules),
             {**common, "section": "encounter"},
         ),
         KnowledgeDocument(
-            "MIMIC FHIR identifier and timezone policy:\n" + dump_json(identifiers),
+            f"{label} FHIR identifier and timezone policy:\n"
+            + dump_json(identifiers),
             {**common, "section": "identifiers_and_timezone"},
         ),
         KnowledgeDocument(
-            "MIMIC diagnosis and procedure ICD terminology policy:\n" + dump_json(terminology),
+            f"{label} diagnosis and procedure terminology policy:\n"
+            + dump_json(terminology),
             {**common, "section": "icd_terminology"},
         ),
     ]

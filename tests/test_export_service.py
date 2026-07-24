@@ -10,8 +10,8 @@ from fhir_agent_pipeline.config import load_settings
 from fhir_agent_pipeline.export_service import (
     ExportRequest,
     FhirBatchExportService,
-    iter_demo_subject_ids,
-    resolve_demo_patient_file,
+    iter_cohort_patient_ids,
+    resolve_cohort_patient_file,
 )
 
 
@@ -42,9 +42,9 @@ def test_demo_patient_identifiers_define_export_cohort(tmp_path: Path) -> None:
     settings = replace(
         load_settings(require_database=False), mimic_fhir_demo_path=tmp_path
     )
-    assert resolve_demo_patient_file(tmp_path) == patient_file
-    assert list(iter_demo_subject_ids(settings, limit=None)) == [10007795, 10007928]
-    assert list(iter_demo_subject_ids(settings, limit=1)) == [10007795]
+    assert resolve_cohort_patient_file(settings) == patient_file
+    assert list(iter_cohort_patient_ids(settings, limit=None)) == [10007795, 10007928]
+    assert list(iter_cohort_patient_ids(settings, limit=1)) == [10007795]
 
 
 def test_batch_export_persists_then_validates(monkeypatch, tmp_path: Path) -> None:

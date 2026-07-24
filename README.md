@@ -353,6 +353,141 @@ python main.py compare-rag \
 매핑 계약에 포함되지 않은 최상위 필드 목록은 코드에 중복 선언하지 않고
 `db/mimic_mapping_config.json`의 `evaluation.allowed_top_level_fields`에서 관리합니다.
 
+## 100명 전체 cohort 실행 결과
+
+2026-07-24 `MimicPatient.ndjson.gz`의 전체 100명을 대상으로 실행한
+`fhir_export/manifest.json` 결과입니다.
+
+### End-to-end 결과
+
+| 구분 | 환자 수 | 전체 100명 기준 |
+|---|---:|---:|
+| 생성 완료 | 46 | 46% |
+| FHIR Validator 통과 | 42 | 42% |
+| FHIR Validator 실패 | 4 | 4% |
+| 생성 단계 실패 | 54 | 54% |
+| FHIR와 Task 품질 모두 통과 | 33 | 33% |
+
+생성된 46개 Bundle만 분모로 사용하면 FHIR Validation Pass Rate는
+`42 / 46 = 91.30%`입니다. 그러나 전체 cohort의 엄격한 end-to-end 성공률은
+FHIR 검증과 DB 원본 기반 Task 품질을 모두 통과한 `33 / 100 = 33%`입니다.
+
+Manifest의 `overall_task_pass_rate=0.7609`는 생성 완료 Bundle 중
+`task_quality_pass=true`인 `35 / 46`을 나타냅니다. FHIR 검증까지 포함한
+end-to-end 통과율과 구분해서 해석해야 합니다.
+
+### 생성 리소스와 조건부 품질
+
+생성 완료된 46명에서 총 1,128개 리소스가 생성됐으며, 환자당 평균은
+약 24.5개입니다.
+
+| 리소스 | 생성 수 | 생성 완료 환자당 평균 |
+|---|---:|---:|
+| Patient | 46 | 1.00 |
+| Encounter | 46 | 1.00 |
+| Condition | 415 | 9.02 |
+| Procedure | 161 | 3.50 |
+| Observation | 460 | 10.00 |
+
+| 평가 지표 | 결과 | 설명 |
+|---|---:|---|
+| Source Field Accuracy | 99.77% | SQL 조회 원천 필드와 생성된 FHIR 필드가 정확히 일치한 비율 |
+| Clinical Resource Macro F1 | 100% | Condition, Procedure, Observation의 리소스별 F1을 동일 가중치로 평균한 값 |
+| Resource Count Alignment | 100% | SQL 소스 행 수와 생성 FHIR 리소스 수가 일치한 비율 |
+| Reference Accuracy | 100% | Patient와 Encounter 참조가 원천 행의 대상과 정확히 일치한 비율 |
+| Coding Accuracy | 100% | ICD·검사 코드의 system/code와 소스 display, UCUM 코드가 기대값과 일치한 비율 |
+| JSON Schema Pass Rate | 100% | 생성 리소스가 공식 FHIR R4 JSON Schema를 통과한 비율 |
+| Observation Value Accuracy | 98.47% | Observation의 valueQuantity 또는 valueString이 원천 검사값과 일치한 비율 |
+| Observation Unit Accuracy | 98.90% | Observation 값과 참고범위의 unit 및 UCUM code가 기대값과 일치한 비율 |
+| Observation Time Accuracy | 99.13% | Observation.effectiveDateTime이 원천 charttime과 일치한 비율 |
+| Encounter Field Accuracy | 98.26% | Encounter의 ID, 상태, class, 기간, 식별자와 Patient 참조가 원천·매핑 규칙과 일치한 비율 |
+
+이 결과는 생성에 성공한 46명과 LLM SQL이 반환한 소스 행을 기준으로 합니다.
+실패한 54명과 SQL이 조회하지 못한 DB 행은 Accuracy/F1 분모에 포함되지 않으므로,
+위 수치를 전체 cohort의 end-to-end 정확도로 해석하면 안 됩니다.
+
+### 실패 원인
+
+54건의 생성 실패는 다음 두 원인에 집중됐습니다.
+
+| 실패 원인 | 환자 수 | 전체 실패 중 비율 |
+|---|---:|---:|
+| Procedure 소스 행 0건을 오류로 처리 | 22 | 40.7% |
+| Observation이 2회 교정 후에도 실패 | 32 | 59.3% |
+
+Procedure가 없는 환자는 정상적인 임상 사례일 수 있으므로, 선택 임상 리소스의
+0건 조회를 정상 결과로 허용하지 않는 정책이 전체 완주율을 크게 낮췄습니다.
+
+Observation 실패는 주로 다음 값의 null/빈 문자열 처리와 UCUM 변환에서 발생했습니다.
+
+- `valueQuantity.unit` 누락 또는 빈 값: 24건
+- `valueQuantity.code` 누락: 22건
+- `referenceRange`의 value/unit/code 오류: 16건
+- 기대 UCUM 코드 불일치: 15건
+- 숫자 `valueQuantity.value`가 null: 2건
+
+위 항목은 한 실패에 여러 오류가 함께 나타날 수 있으므로 중복 집계입니다.
+
+### HL7 FHIR Validator 결과
+
+| Severity | 누적 개수 |
+|---|---:|
+| fatal | 0 |
+| error | 21 |
+| warning | 2,922 |
+| information | 17 |
+
+Validator error가 발생한 환자는 `10004720`, `10026354`, `10018423`,
+`10015931`입니다. 주요 error는 UCUM 코드 `mm Hg`, 비표준 단위 `units`,
+일부 ICD-10 Procedure 코드 검증 실패입니다. `mm Hg`의 UCUM 코드는
+`mm[Hg]`로 정규화해야 합니다.
+
+주요 warning은 MIMIC의 시간 이동으로 인한 2100년 이후 날짜, Validator가 알지
+못하는 `urn:mimic:itemid` CodeSystem, narrative와 Observation performer 누락,
+표준 코드 없이 text만 있는 interpretation입니다. 누적 warning은 생성 Bundle당
+평균 63.5건, 리소스당 약 2.59건입니다.
+
+### LLM SQL과 자동 교정
+
+생성 완료 46명에 기록된 LLM 호출은 총 939회이며, 환자당 평균 20.41회,
+중앙값 20회입니다. 실패한 환자의 호출 횟수는 manifest에 남지 않으므로 실제
+전체 호출량은 이보다 큽니다.
+
+| 항목 | 결과 |
+|---|---:|
+| FHIR 생성 배치 | 624 |
+| 배치 First-pass Validity Rate | 93.75% |
+| 기록된 repair 횟수 | 39 |
+| 기록된 Repair Success Rate | 100% |
+| SQL 질의 | 230 |
+| SQL First-pass Success Rate | 80% |
+| SQL DB 실행 실패 후 교정 | 46 |
+
+리소스별 FHIR 배치 first-pass 통과율은 Patient 82.61%, Encounter 100%,
+Condition 100%, Procedure 73.91%, Observation 96.96%입니다.
+
+`Repair Success Rate=100%`는 생성 완료 환자에 포함된 repair만 집계한 값입니다.
+Observation 교정에 최종 실패한 32명의 telemetry는 집계되지 않으므로 전체 cohort의
+실제 repair 성공률로 사용할 수 없습니다. 또한 생성 완료 환자마다 SQL DB 실행
+교정이 정확히 한 번 발생했지만, manifest에는 실패한 리소스 종류와 SQL이 없어
+체계적인 원인을 추가로 추적해야 합니다.
+
+### 결과 해석과 개선 우선순위
+
+현재 결과는 “생성에 성공했을 때의 변환 정확도는 높지만, 전체 환자를 끝까지
+처리하는 운영 완주율은 낮다”로 요약할 수 있습니다. RAG는 활성화됐지만 비교
+실행이 없어 `rag_ablation_improvement`는 `null`이며, 현재 결과만으로 RAG의
+개선 효과를 결론 내릴 수 없습니다.
+
+우선순위는 다음과 같습니다.
+
+1. Procedure 등 선택 임상 리소스의 0건 조회를 정상 결과로 허용
+2. Observation null 필드를 LLM 호출 전에 결정적으로 생략
+3. `mm Hg → mm[Hg]` 등 UCUM 정규화 규칙 보강
+4. 실패 환자도 SQL/FHIR 호출 및 repair telemetry를 manifest에 보존
+5. `overall_task_pass_rate`와 strict end-to-end pass rate를 분리
+6. 동일 cohort의 LLM-only와 LLM+RAG paired ablation 실행
+
 ## 코드 구조
 
 ```text
@@ -375,51 +510,3 @@ fhir_agent_pipeline/export_service.py    demo cohort 선택과 동일 LLM Pipeli
 db/mimic_mapping_config.json             외부 매핑 정책
 tests/                                   DB/Ollama 없이 실행하는 회귀 테스트
 ```
-
-## 리팩터링 결과
-
-제거한 legacy/중복 구현:
-
-- `pipeline.py`: 결정적 변환 Pipeline
-- `normalization.py`: Builder와 Builder를 상속한 Normalizer
-- `MappingAgent`와 Mapping Advisor 프롬프트
-- `--deterministic`, `--with-llm-advisor`, `benchmark` 명령
-- 직접 DB→Builder 추출 모델과 조회 함수
-- `PatientDemoRow`, `MultiAgentFhirPipeline` 등 호환 alias
-- 루트의 중복 `config.py`와 구형 환경 예제
-- 리소스별 Pydantic 클래스는 제거하고, JSON Schema 누락 필수값은 `ResourceAdapter`의 공통 규칙으로 통합
-- 세 군데에 있던 PostgreSQL 식별자 검사 구현
-
-현재 모든 생성 경로는 `LlmSqlToFhirPipeline` 하나로 수렴합니다.
-
-## 테스트 및 최근 실제 검증
-
-```bash
-pytest -q
-```
-
-2026-07-23 실제 환경에서 `gemma4:e4b`로 환자 `10000032`, 입원 `25742920`의
-DB 조회 → LLM FHIR 생성 → 자동 교정 → HL7 Validator → 독립 재검증을 확인했습니다.
-
-| 항목 | 결과 |
-|---|---:|
-| VectorDB | FHIR 11,503 / SQL 10 |
-| 조회·생성 리소스 | Patient 1 / Encounter 1 / Condition 10 / Procedure 1 / Observation 10 |
-| 전체 리소스 | 23 |
-| 전체 LLM 호출 | 20 (SQL 6 / FHIR 14) |
-| DB 원본 필드 정확도 | 256/256 (`1.0`) |
-| Condition/Procedure/Observation macro F1 | `1.0` |
-| 논리 참조 정확도 | 43/43 (`1.0`) |
-| coding system/code 정확도 | 42/42 (`1.0`) |
-| 근거 없는 최상위 필드 | 0 |
-| SQL 초회 성공 / 안전 통과 | `0.8` / `1.0` |
-| FHIR 자동 교정 | 1회, 최종 성공 |
-| HL7 Validator | fatal 0 / error 0 / warning 60 |
-| 독립 재검증 | `valid: true` |
-
-HL7 warning은 프로파일·권장 표현 관련 경고이며 fatal/error는 없었습니다. 이 실제 실행에서
-기존 구조 검증만으로 발견하지 못했던 Condition/Procedure `identifier.value` 불일치를 새
-원본 충실도 평가가 검출했고, source row별 기대 ID를 생성 계약과 강제 검사에 추가한 뒤
-재실행하여 256개 평가 필드가 모두 일치했습니다.
-
-리팩터링 후 회귀 테스트 결과는 `28 passed`입니다.

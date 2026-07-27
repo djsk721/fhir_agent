@@ -42,6 +42,42 @@ def test_sql_policy_uses_exact_catalog_relations() -> None:
     assert policy.allowed_relations == frozenset({("clinical", "visit")})
 
 
+def test_schema_hint_prioritizes_dynamic_foreign_key_relationships() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "alpha",
+            "visit_event",
+            (
+                SourceColumn("visit_key", "INTEGER", True),
+                SourceColumn("person_key", "INTEGER", False),
+            ),
+            (),
+        ),
+        SourceTable(
+            "beta",
+            "measurement",
+            (
+                SourceColumn("measurement_key", "INTEGER", True),
+                SourceColumn("visit_key", "INTEGER", False),
+            ),
+            (
+                SourceForeignKey(
+                    ("visit_key",),
+                    "alpha",
+                    "visit_event",
+                    ("visit_key",),
+                ),
+            ),
+        ),
+    ))
+
+    hint = catalog.schema_hint({("alpha", "visit_event")})
+
+    assert "PostgreSQL table alpha.visit_event" in hint
+    assert "PostgreSQL table beta.measurement" in hint
+    assert "visit_key -> alpha.visit_event(visit_key)" in hint
+
+
 def test_alias_repair_respects_cte_scope_and_uses_metadata() -> None:
     catalog = SourceSchemaCatalog((
         SourceTable(

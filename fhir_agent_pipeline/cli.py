@@ -186,6 +186,20 @@ def doctor() -> dict[str, Any]:
         "source_data_path": str(settings.source_data_path),
         "cohort_patient_file": demo_patient_file,
         "fhir_export_directory": str(settings.fhir_export_directory),
+        "extraction_limits": {
+            "sql_max_rows": settings.sql_max_rows,
+            "max_encounters": settings.max_encounters,
+            "max_observations_per_encounter": (
+                settings.max_observations_per_encounter
+            ),
+            "max_conditions_per_encounter": (
+                settings.max_conditions_per_encounter
+            ),
+            "max_procedures_per_encounter": (
+                settings.max_procedures_per_encounter
+            ),
+            "llm_fhir_batch_size": settings.llm_fhir_batch_size,
+        },
         "database": _database_diagnostic(settings),
         "ollama": settings.ollama_base_url,
         "postgres_driver": {

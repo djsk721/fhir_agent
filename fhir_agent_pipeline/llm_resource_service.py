@@ -349,6 +349,7 @@ class FhirLlmResourceService:
         normalized = dict(resource)
         normalized["resourceType"] = resource_type
         normalized["id"] = stable_resource_id(resource_type, row)
+        self._normalize_direct_source_properties(resource_type, row, normalized)
         normalized.pop("identifier", None)
         for unsupported in (
             "meta",
@@ -448,3 +449,30 @@ class FhirLlmResourceService:
                 else:
                     normalized.pop("referenceRange", None)
         return _remove_empty(normalized)
+
+    def _normalize_direct_source_properties(
+        self,
+        resource_type: str,
+        row: dict[str, Any],
+        resource: dict[str, Any],
+    ) -> None:
+        """FHIR 속성과 이름이 같은 원천 alias를 스키마에 맞춰 반영합니다.
+
+        예: `_interpretation` -> `interpretation`. 병원별 테이블/컬럼 의미를
+        추정하지 않으며, 실제 FHIR 속성으로 정의된 이름만 처리합니다.
+        """
+        for source_name, source_value in row.items():
+            if not source_name.startswith("_") or source_name.startswith("__"):
+                continue
+            property_name = source_name[1:]
+            property_schema = self.schema.property_schema(
+                resource_type, property_name
+            )
+            if property_schema is None:
+                continue
+            if source_value in (None, ""):
+                resource.pop(property_name, None)
+                continue
+            resource[property_name] = self.schema.coerce_source_value(
+                property_schema, source_value
+            )

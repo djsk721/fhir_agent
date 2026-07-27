@@ -10,6 +10,7 @@ from fhir_agent_pipeline.config import load_settings
 from fhir_agent_pipeline.export_service import (
     ExportRequest,
     FhirBatchExportService,
+    _aggregate,
     iter_cohort_patient_ids,
     resolve_cohort_patient_file,
 )
@@ -22,6 +23,34 @@ def test_export_request_requires_explicit_scope(tmp_path: Path) -> None:
         ExportRequest(
             output_directory=tmp_path, patient_keys=(1,), limit=1
         ).validate()
+
+
+def test_manifest_reports_queries_that_reached_row_limit(
+    tmp_path: Path,
+) -> None:
+    summary = _aggregate(
+        [
+            {
+                "status": "valid",
+                "sql_generation_metrics": {
+                    "row_limit_reached_queries": 2,
+                },
+            },
+            {
+                "status": "valid",
+                "task_evaluation": {
+                    "sql": {"row_limit_reached_queries": 0},
+                },
+            },
+        ],
+        tmp_path,
+    )
+
+    assert summary["extraction_completeness"] == {
+        "row_limit_reached_queries": 2,
+        "patients_reaching_row_limit": 1,
+        "requires_limit_review": True,
+    }
 
 
 def test_demo_patient_identifiers_define_export_cohort(tmp_path: Path) -> None:

@@ -4,8 +4,13 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from fhir_agent_pipeline.config import load_settings
+from fhir_agent_pipeline.llm_query_service import (
+    EncounterQueryContext,
+    LlmClinicalQueryService,
+)
 from fhir_agent_pipeline.sql_agent import (
     NaturalLanguageSqlAgent,
+    SqlAnswer,
     SqlGenerationError,
     SqlResultValidationError,
     SqlSchemaContext,
@@ -136,3 +141,104 @@ def test_safety_policy_error_is_self_corrected() -> None:
 
     assert answer.llm_calls_used == 2
     assert answer.failure_categories == ("safety_policy",)
+
+
+def test_execution_semantics_error_is_self_corrected() -> None:
+    agent = _agent()
+    validations = 0
+
+    def validate_execution(_sql, _rows):
+        nonlocal validations
+        validations += 1
+        if validations == 1:
+            raise SqlResultValidationError(
+                "result_encounter_scope_narrowing",
+                "dependent relation narrowed encounter coverage",
+            )
+
+    answer = agent.ask(
+        "all encounters for patient 7",
+        execution_validator=validate_execution,
+    )
+
+    assert answer.llm_calls_used == 2
+    assert answer.failure_categories == (
+        "result_encounter_scope_narrowing",
+    )
+    assert "broadest canonical encounter" in agent.llm.prompts[1]
+
+
+def test_missing_exact_alias_error_adds_focused_correction() -> None:
+    agent = _agent()
+    validations = 0
+
+    def validate_result(_rows):
+        nonlocal validations
+        validations += 1
+        if validations == 1:
+            raise SqlResultValidationError(
+                "result_required_columns",
+                "missing: _patient_key",
+            )
+
+    answer = agent.ask("condition rows", result_validator=validate_result)
+
+    assert answer.llm_calls_used == 2
+    assert answer.failure_categories == ("result_required_columns",)
+    assert "including its leading underscore" in agent.llm.prompts[1]
+
+
+def test_semantic_relationship_retry_accepts_confirmed_empty_source() -> None:
+    class Catalog:
+        schemas = {"alpha"}
+
+    class Gateway:
+        catalog = Catalog()
+
+    class Agent:
+        gateway = Gateway()
+
+        def ask(self, question, result_validator, execution_validator=None):
+            if execution_validator:
+                execution_validator(
+                    "SELECT * FROM (SELECT 1 FROM alpha.event) AS q",
+                    [],
+                )
+            with pytest.raises(SqlResultValidationError) as captured:
+                result_validator([])
+            assert captured.value.category == "result_relationship_empty"
+            result_validator([])
+            return SqlAnswer(
+                question=question,
+                sql="SELECT * FROM (SELECT 1 FROM alpha.event) AS q",
+                rows=[],
+                explanation="원천 데이터 부재 확인",
+                llm_calls_used=2,
+                failure_categories=("result_relationship_empty",),
+            )
+
+    service = LlmClinicalQueryService(
+        load_settings(require_database=False),
+        sql_agent=Agent(),
+    )
+    context = EncounterQueryContext(
+        keys=("VISIT-1",),
+        source_relations=("alpha.visit",),
+        sql="SELECT visit_key AS _encounter_key FROM alpha.visit",
+        schema_hint="alpha.visit: person_key, visit_key",
+    )
+
+    result = service.query(
+        "Condition",
+        "PERSON-1",
+        context,
+        None,
+        semantic_relationship_retry=True,
+        previous_sql="SELECT * FROM alpha.event WHERE visit_key = 'VISIT-1'",
+    )
+
+    assert result.rows == []
+    assert result.trace.semantic_relationship_retry
+    assert result.trace.encounter_context_relations == ("alpha.visit",)
+    assert "alpha.visit" in result.trace.question
+    assert "Previous zero-row SQL" in result.trace.question

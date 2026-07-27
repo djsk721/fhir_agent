@@ -22,6 +22,61 @@ class FhirSchemaRepository:
     def definition(self, resource_type: str) -> dict[str, Any]:
         return self.definitions.get(resource_type, {})
 
+    def property_schema(
+        self,
+        resource_type: str,
+        property_name: str,
+    ) -> dict[str, Any] | None:
+        """리소스 속성의 공식 JSON Schema 정의를 반환합니다."""
+        value = self.definition(resource_type).get("properties", {}).get(property_name)
+        return value if isinstance(value, dict) else None
+
+    def coerce_source_value(
+        self,
+        property_schema: dict[str, Any],
+        value: Any,
+    ) -> Any:
+        """원천 scalar/list를 FHIR Schema가 요구하는 외형으로만 변환합니다.
+
+        코드나 의미를 추론하지 않고 array 여부와 `text`를 지원하는 FHIR
+        complex datatype의 컨테이너만 보정합니다.
+        """
+        if value in (None, ""):
+            return None
+        if property_schema.get("type") == "array":
+            values = value if isinstance(value, list) else [value]
+            item_schema = property_schema.get("items", {})
+            return [
+                self.coerce_source_value(item_schema, item)
+                for item in values
+                if item not in (None, "")
+            ]
+        reference = property_schema.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/definitions/"):
+            definition_name = reference.rsplit("/", 1)[-1]
+            definition = self.definitions.get(definition_name, {})
+            if isinstance(value, dict):
+                return value
+            if "text" in definition.get("properties", {}):
+                return {"text": str(value)}
+            return self.coerce_source_value(definition, value)
+        value_type = property_schema.get("type")
+        if value_type == "string":
+            return str(value)
+        if value_type == "number":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return value
+        if value_type == "integer":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+        if value_type == "boolean" and isinstance(value, bool):
+            return value
+        return value
+
     def errors(self, resource: dict[str, Any]) -> list[str]:
         resource_type = str(resource.get("resourceType", ""))
         if resource_type not in self.definitions:

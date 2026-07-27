@@ -65,6 +65,43 @@ _NAMED_ALIAS = re.compile(
     r'\b(?:FROM|JOIN)\s+("?[\w]+"?)(?!\s*\.)\s+AS\s+("?[\w]+"?)',
     re.IGNORECASE,
 )
+_JOIN_KIND = re.compile(
+    r"\b(?:(LEFT|RIGHT|FULL|INNER|CROSS)\s+(?:OUTER\s+)?)?JOIN\b",
+    re.IGNORECASE,
+)
+_EXISTENCE_FILTER = re.compile(
+    r"\bEXISTS\s*\(|\bIN\s*\(\s*SELECT\b",
+    re.IGNORECASE,
+)
+
+
+def referenced_source_relations(sql: str) -> tuple[str, ...]:
+    """실행 SQL에서 schema-qualified 원천 relation lineage를 추출합니다."""
+
+    def normalize(value: str) -> str:
+        return value.strip('"').lower()
+
+    relations = {
+        f"{normalize(match.group(1))}.{normalize(match.group(2))}"
+        for match in _TABLE.finditer(sql)
+        if match.group(2)
+    }
+    return tuple(sorted(relations))
+
+
+def row_restricting_relationships(sql: str) -> tuple[str, ...]:
+    """Encounter 후보를 하위 relation 존재 여부로 줄일 수 있는 SQL 구조입니다."""
+
+    reasons: list[str] = []
+    join_kinds = [
+        (match.group(1) or "INNER").upper()
+        for match in _JOIN_KIND.finditer(sql)
+    ]
+    if any(kind in {"INNER", "CROSS"} for kind in join_kinds):
+        reasons.append("INNER/CROSS JOIN")
+    if _EXISTENCE_FILTER.search(sql):
+        reasons.append("EXISTS/IN subquery")
+    return tuple(reasons)
 
 
 def neutralize_invented_optional_aliases(sql: str) -> str:
@@ -554,6 +591,9 @@ class NaturalLanguageSqlAgent:
         question: str,
         max_attempts: int | None = None,
         result_validator: Callable[[list[dict[str, Any]]], None] | None = None,
+        execution_validator: (
+            Callable[[str, list[dict[str, Any]]], None] | None
+        ) = None,
     ) -> SqlAnswer:
         context = self._schema_context(question)
         policy = getattr(self.gateway, "policy", None)
@@ -636,6 +676,13 @@ schema context; changing only the filter syntax is not a correction.
                     category = "database_execution"
                     failure_categories.append(category)
                     raise exc
+                if execution_validator:
+                    try:
+                        execution_validator(sql, rows)
+                    except SqlResultValidationError as exc:
+                        category = exc.category
+                        failure_categories.append(category)
+                        raise
                 if result_validator:
                     try:
                         result_validator(rows)
@@ -708,6 +755,17 @@ schema context; changing only the filter syntax is not a correction.
                     )
                 if (
                     isinstance(exc, SqlResultValidationError)
+                    and exc.category == "result_required_columns"
+                ):
+                    previous_error += (
+                        "\nCorrection required: use every requested output alias "
+                        "exactly as written, including its leading underscore. "
+                        "For example, `AS patient_key` does not satisfy "
+                        "`AS _patient_key`. Do not rename, translate, or omit any "
+                        "required alias listed in the validation error."
+                    )
+                if (
+                    isinstance(exc, SqlResultValidationError)
                     and exc.category == "result_resource_identity"
                 ):
                     previous_error += (
@@ -716,6 +774,44 @@ schema context; changing only the filter syntax is not a correction.
                         "encounter, or stay. Use a documented event-row key or "
                         "combine enough documented event columns to be non-null "
                         "and unique. Verify uniqueness before returning SQL."
+                    )
+                if (
+                    isinstance(exc, SqlResultValidationError)
+                    and exc.category == "result_relationship_empty"
+                ):
+                    previous_error += (
+                        "\nCorrection required: the SQL executed but returned no "
+                        "rows during a cross-resource relationship re-check. "
+                        "Do not assume that a clinical relation stores the selected "
+                        "encounter key directly. Re-read the supplied encounter SQL "
+                        "lineage and retrieved PK/FK metadata, then use a documented "
+                        "join path back to the selected encounter relation. If the "
+                        "source truly has no matching row, a second empty result is "
+                        "accepted; never invent data."
+                    )
+                if (
+                    isinstance(exc, SqlResultValidationError)
+                    and exc.category == "result_encounter_scope_narrowing"
+                ):
+                    previous_error += (
+                        "\nCorrection required: select encounters from the "
+                        "broadest canonical encounter/visit relation itself. "
+                        "Do not use INNER/CROSS JOIN, EXISTS, or IN-subquery "
+                        "against a dependent clinical, event, location, session, "
+                        "or stay relation to decide whether an encounter exists. "
+                        "Prefer one relation that already stores patient key, "
+                        "encounter key, and period; return NULL for unavailable "
+                        "optional fields. This is a source-neutral coverage rule."
+                    )
+                if (
+                    isinstance(exc, SqlResultValidationError)
+                    and exc.category == "result_encounter_identity"
+                ):
+                    previous_error += (
+                        "\nCorrection required: each canonical Encounter key must "
+                        "be non-null and appear exactly once. Remove fan-out joins "
+                        "and select distinct source encounter rows without hiding "
+                        "different encounters."
                     )
                 previous_sql = proposed_sql
                 attempt_traces.append(

@@ -8,7 +8,12 @@ from .config import Settings
 from .fhir_models import build_bundle
 from .evaluation import evaluate_task_output
 from .fhir_schema import get_fhir_schema
-from .llm_query_service import LlmClinicalQueryService, LlmQueryTrace
+from .llm_query_service import (
+    EncounterQueryContext,
+    LlmClinicalQueryService,
+    LlmQueryTrace,
+    QueriedResourceRows,
+)
 from .llm_resource_service import FhirGenerationError, FhirLlmResourceService
 from .performance import build_performance_metrics
 from .resource_registry import selected_adapters
@@ -168,26 +173,73 @@ class LlmSqlToFhirPipeline:
         generation_metrics: dict[str, dict[str, int | float]] = {}
         source_rows: dict[str, list[dict[str, Any]]] = {}
         generated_by_type: dict[str, list[dict[str, Any]]] = {}
-        encounter_keys: list[int | str] = []
+        queried_by_type: dict[str, QueriedResourceRows] = {}
+        encounter_context = EncounterQueryContext()
         total_calls = 0
         current_resource_type: str | None = None
+        adapters = selected_adapters(self.settings.fhir_output_resources)
 
         try:
-            for adapter in selected_adapters(self.settings.fhir_output_resources):
+            for adapter in adapters:
                 current_resource_type = adapter.resource_type
                 queried = self.query_service.query(
                     adapter.resource_type,
                     patient_key,
-                    encounter_keys,
+                    encounter_context,
                     encounter_key,
                 )
                 traces.append(queried.trace)
+                queried_by_type[adapter.resource_type] = queried
                 source_counts[adapter.resource_type] = len(queried.rows)
                 source_rows[adapter.resource_type] = queried.rows
                 total_calls += queried.trace.llm_calls_used
                 if adapter.resource_type == "Encounter":
-                    encounter_keys = self.query_service.encounter_ids(queried.rows)
+                    context_builder = getattr(
+                        self.query_service, "build_encounter_context", None
+                    )
+                    if callable(context_builder):
+                        encounter_context = context_builder(queried)
+                    else:
+                        encounter_context = EncounterQueryContext(
+                            keys=tuple(
+                                self.query_service.encounter_ids(queried.rows)
+                            )
+                        )
 
+            relationship_adapters = [
+                adapter
+                for adapter in adapters
+                if "Encounter" in adapter.dependencies
+                and not adapter.source_required
+            ]
+            if (
+                encounter_context.keys
+                and len(relationship_adapters) >= 2
+                and all(
+                    not queried_by_type[adapter.resource_type].rows
+                    for adapter in relationship_adapters
+                )
+            ):
+                for adapter in relationship_adapters:
+                    current_resource_type = adapter.resource_type
+                    previous = queried_by_type[adapter.resource_type]
+                    retried = self.query_service.query(
+                        adapter.resource_type,
+                        patient_key,
+                        encounter_context,
+                        encounter_key,
+                        semantic_relationship_retry=True,
+                        previous_sql=previous.trace.sql,
+                    )
+                    traces.append(retried.trace)
+                    queried_by_type[adapter.resource_type] = retried
+                    source_counts[adapter.resource_type] = len(retried.rows)
+                    source_rows[adapter.resource_type] = retried.rows
+                    total_calls += retried.trace.llm_calls_used
+
+            for adapter in adapters:
+                current_resource_type = adapter.resource_type
+                queried = queried_by_type[adapter.resource_type]
                 generation_result = self.resource_service.generate(
                     adapter.resource_type, queried.rows, patient_key
                 )
@@ -284,6 +336,31 @@ def _sql_metrics(traces: list[LlmQueryTrace]) -> dict[str, int | float]:
         "result_scope_failures": sum(
             category in {"result_patient_scope", "result_encounter_scope"}
             for category in categories
+        ),
+        "encounter_scope_narrowing_rejections": categories.count(
+            "result_encounter_scope_narrowing"
+        ),
+        "encounter_identity_rejections": categories.count(
+            "result_encounter_identity"
+        ),
+        "normalized_contract_aliases": sum(
+            len(item.normalized_contract_aliases) for item in traces
+        ),
+        "encounter_qualified_resource_keys": sum(
+            item.encounter_qualified_resource_keys for item in traces
+        ),
+        "row_limit_reached_queries": sum(
+            item.row_limit_reached for item in traces
+        ),
+        "semantic_relationship_rechecks": sum(
+            item.semantic_relationship_retry for item in traces
+        ),
+        "semantic_relationship_empty_retries": categories.count(
+            "result_relationship_empty"
+        ),
+        "semantic_relationship_recoveries": sum(
+            item.semantic_relationship_retry and item.row_count > 0
+            for item in traces
         ),
         "rag_requested_queries": sum(item.rag_requested for item in traces),
         "rag_used_queries": sum(item.rag_used for item in traces),

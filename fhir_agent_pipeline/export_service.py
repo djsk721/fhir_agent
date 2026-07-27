@@ -183,12 +183,22 @@ def _aggregate(records: list[dict[str, Any]], output_directory: Path) -> dict[st
         "reference_accuracy": [],
         "coding_accuracy": [],
     }
+    row_limit_reached_queries = 0
+    patients_reaching_row_limit = 0
     for record in records:
         for resource_type, count in record.get("resource_counts", {}).items():
             resources[resource_type] = resources.get(resource_type, 0) + int(count)
         for severity, count in record.get("validator_issue_counts", {}).items():
             issues[severity] = issues.get(severity, 0) + int(count)
         evaluation = record.get("task_evaluation") or {}
+        sql_metrics = (
+            record.get("sql_generation_metrics")
+            or evaluation.get("sql")
+            or {}
+        )
+        reached = int(sql_metrics.get("row_limit_reached_queries", 0))
+        row_limit_reached_queries += reached
+        patients_reaching_row_limit += reached > 0
         candidates = {
             "source_field_accuracy": evaluation.get(
                 "source_field_accuracy", {}
@@ -216,6 +226,11 @@ def _aggregate(records: list[dict[str, Any]], output_directory: Path) -> dict[st
         "resumed_patients": skipped,
         "resource_counts": resources,
         "validator_issue_counts": issues,
+        "extraction_completeness": {
+            "row_limit_reached_queries": row_limit_reached_queries,
+            "patients_reaching_row_limit": patients_reaching_row_limit,
+            "requires_limit_review": row_limit_reached_queries > 0,
+        },
         "mean_task_evaluation": {
             name: (sum(values) / len(values) if values else None)
             for name, values in evaluation_values.items()

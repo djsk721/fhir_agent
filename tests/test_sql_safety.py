@@ -1,6 +1,8 @@
 from fhir_agent_pipeline.sql_agent import (
     SqlSafetyPolicy,
     neutralize_invented_optional_aliases,
+    referenced_source_relations,
+    row_restricting_relationships,
 )
 
 
@@ -20,6 +22,32 @@ def test_select_is_wrapped_with_row_limit() -> None:
     sql = policy().apply("SELECT person_key FROM clinical.person")
     assert "AS _safe_query" in sql
     assert sql.endswith("LIMIT 100")
+
+
+def test_extracts_dynamic_relation_lineage_without_database_mapping() -> None:
+    sql = (
+        "SELECT v.visit_key FROM alpha.person AS p "
+        "JOIN beta.visit_event AS v ON v.person_key = p.person_key"
+    )
+
+    assert referenced_source_relations(sql) == (
+        "alpha.person",
+        "beta.visit_event",
+    )
+
+
+def test_detects_source_neutral_encounter_scope_narrowing() -> None:
+    assert row_restricting_relationships(
+        "SELECT v.visit_key FROM alpha.visit AS v "
+        "JOIN beta.event AS e ON e.visit_key = v.visit_key"
+    ) == ("INNER/CROSS JOIN",)
+    assert row_restricting_relationships(
+        "SELECT visit_key FROM alpha.visit "
+        "WHERE visit_key IN (SELECT visit_key FROM beta.event)"
+    ) == ("EXISTS/IN subquery",)
+    assert row_restricting_relationships(
+        "SELECT visit_key FROM alpha.visit WHERE person_key = 7"
+    ) == ()
 
 
 def test_cte_and_qualified_allowed_table() -> None:

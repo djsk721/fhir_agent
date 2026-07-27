@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,8 @@ from .sql_agent import (
     NaturalLanguageSqlAgent,
     SqlAttemptTrace,
     SqlResultValidationError,
+    referenced_source_relations,
+    row_restricting_relationships,
 )
 
 
@@ -28,12 +31,42 @@ class LlmQueryTrace:
     rag_used: bool = False
     retrieved_document_count: int = 0
     retrieval_fallback_reason: str | None = None
+    encounter_context_relations: tuple[str, ...] = ()
+    semantic_relationship_retry: bool = False
+    normalized_contract_aliases: tuple[str, ...] = ()
+    encounter_qualified_resource_keys: int = 0
+    requested_row_limit: int = 0
+    row_limit_reached: bool = False
 
 
 @dataclass(frozen=True)
 class QueriedResourceRows:
     trace: LlmQueryTrace
     rows: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class EncounterQueryContext:
+    """Encounter 값과 이를 선택한 동적 SQL lineage를 후속 조회에 전달합니다."""
+
+    keys: tuple[int | str, ...] = ()
+    source_relations: tuple[str, ...] = ()
+    sql: str = ""
+    schema_hint: str = ""
+
+    def prompt_text(self) -> str:
+        if not self.keys:
+            return "No encounter context is available."
+        keys = ", ".join(str(value) for value in self.keys)
+        relations = ", ".join(self.source_relations) or "not extracted"
+        return (
+            f"Selected encounter keys: {keys}\n"
+            f"Relations used by the executed Encounter SQL: {relations}\n"
+            "Executed Encounter SQL (lineage evidence, not a physical-column "
+            f"mapping):\n{self.sql[:4000]}\n"
+            "Metadata for the selected and structurally related relations:\n"
+            f"{self.schema_hint[:4000] or 'not available'}"
+        )
 
 
 def strip_database_padding(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -44,6 +77,50 @@ def strip_database_padding(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def normalize_contract_aliases(
+    resource_type: str,
+    rows: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """값은 바꾸지 않고 선행 underscore가 빠진 공통 계약 alias만 복원합니다."""
+
+    expected = set(FHIR_SOURCE_ALIASES[resource_type])
+    normalized: set[str] = set()
+    for row in rows:
+        for source_name in list(row):
+            target_name = "_" + source_name.lower().lstrip("_")
+            if (
+                target_name in expected
+                and target_name not in row
+                and source_name != target_name
+            ):
+                row[target_name] = row.pop(source_name)
+                normalized.add(f"{source_name}->{target_name}")
+    return tuple(sorted(normalized))
+
+
+def qualify_cross_encounter_resource_keys(
+    resource_type: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    """다른 Encounter에서 재사용된 source key만 Encounter 범위로 한정합니다."""
+
+    if resource_type in {"Patient", "Encounter"}:
+        return 0
+    counts = Counter(str(row.get("_resource_key")) for row in rows)
+    duplicate_keys = {
+        key for key, count in counts.items()
+        if count > 1 and key not in {"", "None"}
+    }
+    changed = 0
+    for row in rows:
+        key = str(row.get("_resource_key"))
+        encounter_key = row.get("_encounter_key")
+        if key in duplicate_keys and encounter_key not in (None, ""):
+            row["_resource_key"] = f"{encounter_key}|{key}"
+            changed += 1
+    return changed
 
 
 class LlmClinicalQueryService:
@@ -78,17 +155,72 @@ class LlmClinicalQueryService:
         self,
         resource_type: str,
         patient_key: int | str,
-        encounter_keys: list[int | str],
+        encounter_context: EncounterQueryContext,
         encounter_override: int | str | None,
+        *,
+        semantic_relationship_retry: bool = False,
+        previous_sql: str = "",
     ) -> QueriedResourceRows:
-        question = self._question(
-            resource_type, patient_key, encounter_keys, encounter_override
+        requested_row_limit = self._row_limit(
+            resource_type, len(encounter_context.keys)
         )
+        question = self._question(
+            resource_type,
+            patient_key,
+            encounter_context,
+            encounter_override,
+            semantic_relationship_retry,
+            previous_sql,
+            requested_row_limit,
+        )
+        empty_validation_count = 0
+        normalized_aliases: set[str] = set()
+        qualified_resource_keys = 0
+
+        def validate(rows: list[dict[str, Any]]) -> None:
+            nonlocal empty_validation_count, qualified_resource_keys
+            normalized_aliases.update(
+                normalize_contract_aliases(resource_type, rows)
+            )
+            qualified_resource_keys = qualify_cross_encounter_resource_keys(
+                resource_type, rows
+            )
+            self._validate_result(
+                resource_type,
+                rows,
+                patient_key,
+                list(encounter_context.keys),
+            )
+            if (
+                semantic_relationship_retry
+                and resource_type not in {"Patient", "Encounter"}
+                and not rows
+            ):
+                empty_validation_count += 1
+                if empty_validation_count == 1:
+                    raise SqlResultValidationError(
+                        "result_relationship_empty",
+                        "Encounter가 존재하지만 관련 임상 리소스 조회가 모두 "
+                        "0건이어서 동적 relation 및 join 경로를 재검사해야 합니다.",
+                    )
+
+        def validate_execution(
+            sql: str, _rows: list[dict[str, Any]]
+        ) -> None:
+            if resource_type != "Encounter":
+                return
+            narrowing = row_restricting_relationships(sql)
+            if narrowing:
+                raise SqlResultValidationError(
+                    "result_encounter_scope_narrowing",
+                    "Encounter SQL이 일반 방문/입원을 하위 relation 존재 여부로 "
+                    f"축소할 수 있는 구조를 사용했습니다: {', '.join(narrowing)}",
+                )
+
         answer = self.sql_agent.ask(
             question,
-            result_validator=lambda rows: self._validate_result(
-                resource_type, rows, patient_key, encounter_keys
-            ),
+            result_validator=validate,
+            execution_validator=validate_execution,
         )
         rows = strip_database_padding(answer.rows)
         return QueriedResourceRows(
@@ -105,6 +237,19 @@ class LlmClinicalQueryService:
                 rag_used=answer.rag_used,
                 retrieved_document_count=answer.retrieved_document_count,
                 retrieval_fallback_reason=answer.retrieval_fallback_reason,
+                encounter_context_relations=(
+                    referenced_source_relations(answer.sql)
+                    if resource_type == "Encounter"
+                    else encounter_context.source_relations
+                ),
+                semantic_relationship_retry=semantic_relationship_retry,
+                normalized_contract_aliases=tuple(sorted(normalized_aliases)),
+                encounter_qualified_resource_keys=qualified_resource_keys,
+                requested_row_limit=requested_row_limit,
+                row_limit_reached=(
+                    resource_type != "Patient"
+                    and len(rows) >= requested_row_limit
+                ),
             ),
             rows,
         )
@@ -112,15 +257,45 @@ class LlmClinicalQueryService:
     def encounter_ids(self, rows: list[dict[str, Any]]) -> list[int | str]:
         return [row["_encounter_key"] for row in rows]
 
+    def build_encounter_context(
+        self, queried: QueriedResourceRows
+    ) -> EncounterQueryContext:
+        sql = queried.trace.sql
+        schema_hint = ""
+        hint = getattr(self.sql_agent.gateway, "schema_hint", None)
+        if callable(hint):
+            schema_hint = str(hint(sql))
+        return EncounterQueryContext(
+            keys=tuple(self.encounter_ids(queried.rows)),
+            source_relations=referenced_source_relations(sql),
+            sql=sql,
+            schema_hint=schema_hint,
+        )
+
     def _question(
         self,
         resource_type: str,
         patient_key: int | str,
-        encounter_keys: list[int | str],
+        encounter_context: EncounterQueryContext,
         encounter_override: int | str | None,
+        semantic_relationship_retry: bool,
+        previous_sql: str,
+        requested_row_limit: int,
     ) -> str:
+        encounter_keys = list(encounter_context.keys)
         if resource_type not in {"Patient", "Encounter"} and not encounter_keys:
             raise ValueError(f"{resource_type} 조회 전에 Encounter 행이 필요합니다.")
+        retry_instruction = (
+            "Semantic relationship re-check is required because the selected "
+            "Encounter exists while all requested downstream clinical queries "
+            "returned zero rows. Do not assume that the clinical relation stores "
+            "the selected encounter key directly. Use only retrieved metadata to "
+            "find a documented join path back to the relation selected by the "
+            "Encounter SQL. Previous zero-row SQL:\n"
+            + previous_sql[:4000]
+            if semantic_relationship_retry
+            else "No cross-resource semantic retry is requested."
+        )
         values: dict[str, Any] = {
             "source_schemas": ", ".join(sorted(self.sql_agent.gateway.catalog.schemas)),
             "patient_key": self._sql_literal(patient_key),
@@ -133,17 +308,24 @@ class LlmClinicalQueryService:
                 if encounter_override is not None
                 else ""
             ),
-            "limit": {
-                "Encounter": self.settings.max_encounters,
-                "Condition": self.settings.max_conditions_per_encounter
-                * max(1, len(encounter_keys)),
-                "Procedure": self.settings.max_procedures_per_encounter
-                * max(1, len(encounter_keys)),
-                "Observation": self.settings.max_observations_per_encounter
-                * max(1, len(encounter_keys)),
-            }.get(resource_type, 1),
+            "encounter_context": encounter_context.prompt_text(),
+            "relationship_retry_instruction": retry_instruction,
+            "limit": requested_row_limit,
         }
         return self.profile.query_for(resource_type).render(values)
+
+    def _row_limit(self, resource_type: str, encounter_count: int) -> int:
+        """리소스 설정과 SQL 안전 상한 중 작은 값을 LLM과 실행기에 적용합니다."""
+        configured = {
+            "Encounter": self.settings.max_encounters,
+            "Condition": self.settings.max_conditions_per_encounter
+            * max(1, encounter_count),
+            "Procedure": self.settings.max_procedures_per_encounter
+            * max(1, encounter_count),
+            "Observation": self.settings.max_observations_per_encounter
+            * max(1, encounter_count),
+        }.get(resource_type, 1)
+        return min(configured, self.settings.sql_max_rows)
 
     def _validate_result(
         self,
@@ -167,6 +349,16 @@ class LlmClinicalQueryService:
                 f"{resource_type} SQL 결과 alias 누락: {sorted(missing)}",
             )
         allowed_encounters = {str(value) for value in encounter_keys}
+        if resource_type == "Encounter":
+            keys = [str(row.get("_encounter_key")) for row in rows]
+            if len(keys) != len(set(keys)) or any(
+                key in {"", "None"} for key in keys
+            ):
+                raise SqlResultValidationError(
+                    "result_encounter_identity",
+                    "Encounter _encounter_key는 비어 있지 않고 결과 내에서 "
+                    "고유해야 합니다.",
+                )
         if resource_type not in {"Patient", "Encounter"}:
             keys = [str(row.get("_resource_key")) for row in rows]
             if len(keys) != len(set(keys)) or any(

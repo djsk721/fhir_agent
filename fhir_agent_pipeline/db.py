@@ -196,6 +196,24 @@ class SourceSchemaCatalog:
         selected_names = {
             (table.schema.lower(), table.name.lower()) for table in selected
         }
+        directly_related_names = {
+            (
+                foreign_key.referred_schema.lower(),
+                foreign_key.referred_table.lower(),
+            )
+            for table in selected
+            for foreign_key in table.foreign_keys
+        }
+        directly_related_names.update(
+            (table.schema.lower(), table.name.lower())
+            for table in self.tables
+            for foreign_key in table.foreign_keys
+            if (
+                foreign_key.referred_schema.lower(),
+                foreign_key.referred_table.lower(),
+            )
+            in selected_names
+        )
         selected_columns = {
             column.lower()
             for table in selected
@@ -206,12 +224,21 @@ class SourceSchemaCatalog:
                 table
                 for table in self.tables
                 if (table.schema.lower(), table.name.lower()) not in selected_names
-                and len(
-                    selected_columns
-                    & {column.lower() for column in table.column_names}
-                ) >= 2
+                and (
+                    (table.schema.lower(), table.name.lower())
+                    in directly_related_names
+                    or len(
+                        selected_columns
+                        & {column.lower() for column in table.column_names}
+                    )
+                    >= 2
+                )
             ),
             key=lambda table: (
+                -int(
+                    (table.schema.lower(), table.name.lower())
+                    in directly_related_names
+                ),
                 -max(
                     (
                         len(
@@ -230,6 +257,6 @@ class SourceSchemaCatalog:
             ),
         )[:10]
         return "\n".join(
-            f"{table.qualified_name}: {', '.join(table.column_names)}"
+            table.schema_text()
             for table in [*selected, *related]
         )

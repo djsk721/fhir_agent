@@ -4,90 +4,121 @@ from dataclasses import dataclass
 import gzip
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable, Iterator
+from urllib.parse import quote, unquote
 
 from .config import Settings
 from .json_utils import dump_json
-from .llm_pipeline import LlmSqlToFhirPipeline
+from .llm_pipeline import LlmSqlToFhirPipeline, PipelineExecutionError
 from .performance import (
     aggregate_performance_metrics,
     build_performance_metrics,
 )
+from .source_profile import SourceProfile
 from .validation import validate_bundle_detailed
 
 
 @dataclass(frozen=True)
 class ExportRequest:
     output_directory: Path
-    subject_ids: tuple[int, ...] = ()
+    patient_keys: tuple[int | str, ...] = ()
     limit: int | None = None
-    all_demo_patients: bool = False
+    all_cohort_patients: bool = False
     resume: bool = False
 
     def validate(self) -> None:
         selectors = sum(
-            (bool(self.subject_ids), self.limit is not None, self.all_demo_patients)
+            (
+                bool(self.patient_keys),
+                self.limit is not None,
+                self.all_cohort_patients,
+            )
         )
         if selectors != 1:
             raise ValueError(
-                "subject_ids, limit, all_demo_patients 중 하나만 지정해야 합니다."
+                "patient_keys, limit, all_cohort_patients 중 하나만 지정해야 합니다."
             )
         if self.limit is not None and self.limit < 1:
             raise ValueError("limit은 1 이상이어야 합니다.")
 
 
-def resolve_demo_patient_file(root: Path) -> Path:
-    """demo 루트 또는 버전 상위 루트에서 Patient NDJSON gzip을 찾습니다."""
+def resolve_cohort_patient_file(settings: Settings) -> Path:
+    """선택한 source profile의 패턴으로 cohort Patient 파일을 찾습니다."""
 
-    candidates = [
-        root / "MimicPatient.ndjson.gz",
-        root / "fhir" / "MimicPatient.ndjson.gz",
-        *root.glob("*/fhir/MimicPatient.ndjson.gz"),
-    ]
-    available = [path for path in candidates if path.is_file()]
+    profile = SourceProfile.load(settings.source_profile_path)
+    candidates: list[Path] = []
+    for pattern in profile.cohort.patient_file_patterns:
+        candidates.extend(settings.source_data_path.glob(pattern))
+    available = sorted({path.resolve() for path in candidates if path.is_file()})
     if not available:
         raise FileNotFoundError(
-            f"demo Patient NDJSON을 찾을 수 없습니다: {root}"
+            f"{profile.name} cohort Patient 파일을 찾을 수 없습니다: "
+            f"{settings.source_data_path}"
+        )
+    def natural_key(path: Path) -> tuple[tuple[int, int | str], ...]:
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part.lower())
+            for part in re.split(r"(\d+)", str(path))
+            if part
         )
 
-    def version_key(path: Path) -> tuple[int, ...]:
-        version = path.parent.parent.name if path.parent.name == "fhir" else "0"
-        try:
-            return tuple(int(part) for part in version.split("."))
-        except ValueError:
-            return (0,)
-
-    return max(available, key=version_key)
+    return max(available, key=natural_key)
 
 
-def _demo_subject_id(resource: dict[str, Any], path: Path, line_number: int) -> int:
+def _cohort_patient_key(
+    resource: dict[str, Any],
+    path: Path,
+    line_number: int,
+    *,
+    identifier_system: str | None = None,
+    key_type: str = "integer",
+) -> int | str:
     if resource.get("resourceType") != "Patient":
         raise ValueError(f"{path.name}:{line_number}은 Patient 리소스가 아닙니다.")
     identifiers = resource.get("identifier", [])
-    numeric_values: set[int] = set()
+    values: set[int | str] = set()
     for identifier in identifiers if isinstance(identifiers, list) else []:
         if not isinstance(identifier, dict):
             continue
         raw_value = str(identifier.get("value", "")).strip()
-        if raw_value.isdigit():
-            numeric_values.add(int(raw_value))
-    if len(numeric_values) != 1:
+        if not raw_value:
+            continue
+        if key_type == "integer":
+            try:
+                normalized_value: int | str = int(raw_value)
+            except ValueError:
+                continue
+        else:
+            normalized_value = raw_value
+        if not identifier_system or identifier.get("system") == identifier_system:
+            values.add(normalized_value)
+    if len(values) != 1:
         raise ValueError(
-            f"{path.name}:{line_number}에서 DB subject_id 숫자 identifier를 "
-            f"하나로 결정할 수 없습니다: {sorted(numeric_values)}"
+            f"{path.name}:{line_number}에서 DB 환자 키 identifier를 "
+            f"하나로 결정할 수 없습니다: {sorted(str(value) for value in values)}"
         )
-    return numeric_values.pop()
+    return values.pop()
 
 
-def iter_demo_subject_ids(settings: Settings, limit: int | None) -> Iterator[int]:
-    """demo Patient NDJSON의 identifier.value에서 DB subject_id를 읽습니다."""
+def iter_cohort_patient_ids(
+    settings: Settings, limit: int | None
+) -> Iterator[int | str]:
+    """Source profile의 Patient NDJSON에서 DB 환자 키를 읽습니다."""
 
     if limit is not None and limit < 1:
         raise ValueError("limit은 1 이상이어야 합니다.")
-    path = resolve_demo_patient_file(settings.mimic_fhir_demo_path)
-    seen: set[int] = set()
+    profile = SourceProfile.load(settings.source_profile_path)
+    if profile.cohort.provider != "fhir-patient-ndjson":
+        raise ValueError(
+            f"{profile.name} profile은 --limit/--all cohort provider를 "
+            f"지원하지 않습니다: {profile.cohort.provider}"
+        )
+    path = resolve_cohort_patient_file(settings)
+    seen: set[int | str] = set()
     yielded = 0
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
                 continue
@@ -97,20 +128,29 @@ def iter_demo_subject_ids(settings: Settings, limit: int | None) -> Iterator[int
                 raise ValueError(
                     f"{path.name}:{line_number} JSON 파싱 실패: {exc}"
                 ) from exc
-            subject_id = _demo_subject_id(resource, path, line_number)
-            if subject_id in seen:
+            patient_key = _cohort_patient_key(
+                resource,
+                path,
+                line_number,
+                identifier_system=profile.cohort.identifier_system,
+                key_type=profile.cohort.key_type,
+            )
+            if patient_key in seen:
                 raise ValueError(
-                    f"{path.name}:{line_number} subject_id가 중복됐습니다: {subject_id}"
+                    f"{path.name}:{line_number} patient_key가 중복됐습니다: {patient_key}"
                 )
-            seen.add(subject_id)
-            yield subject_id
+            seen.add(patient_key)
+            yield patient_key
             yielded += 1
             if limit is not None and yielded >= limit:
                 return
 
 
-def _paths(output_directory: Path, subject_id: int) -> tuple[Path, Path]:
-    stem = output_directory / f"subject-{subject_id}"
+def _paths(
+    output_directory: Path, patient_key: int | str
+) -> tuple[Path, Path]:
+    safe_key = quote(str(patient_key), safe="")
+    stem = output_directory / f"patient-{safe_key}"
     return stem.with_suffix(".bundle.json"), stem.with_suffix(".validation.json")
 
 
@@ -186,17 +226,17 @@ def _aggregate(records: list[dict[str, Any]], output_directory: Path) -> dict[st
 
 
 class FhirBatchExportService:
-    """demo cohort 환자를 DB→LLM→FHIR로 변환하고 저장 파일을 검증합니다."""
+    """Profile cohort 환자를 DB→LLM→FHIR로 변환하고 저장 파일을 검증합니다."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def _subject_ids(self, request: ExportRequest) -> Iterable[int]:
-        if request.subject_ids:
-            return request.subject_ids
-        return iter_demo_subject_ids(
+    def _patient_keys(self, request: ExportRequest) -> Iterable[int | str]:
+        if request.patient_keys:
+            return request.patient_keys
+        return iter_cohort_patient_ids(
             self._settings,
-            limit=None if request.all_demo_patients else request.limit,
+            limit=None if request.all_cohort_patients else request.limit,
         )
 
     def run(self, request: ExportRequest) -> dict[str, Any]:
@@ -207,16 +247,16 @@ class FhirBatchExportService:
         records: list[dict[str, Any]] = []
         cohort = (
             {
-                "source": "explicit-subject-ids",
-                "requested_subject_ids": list(request.subject_ids),
+                "source": "explicit-patient-ids",
+                "requested_patient_keys": list(request.patient_keys),
             }
-            if request.subject_ids
+            if request.patient_keys
             else {
-                "source": "mimic-fhir-demo-patient-ndjson",
+                "source": "source-profile-fhir-patient-ndjson",
                 "patient_file": str(
-                    resolve_demo_patient_file(self._settings.mimic_fhir_demo_path)
+                    resolve_cohort_patient_file(self._settings)
                 ),
-                "limit": None if request.all_demo_patients else request.limit,
+                "limit": None if request.all_cohort_patients else request.limit,
             }
         )
 
@@ -226,33 +266,51 @@ class FhirBatchExportService:
                 "cohort": cohort,
             }
 
-        for subject_id in self._subject_ids(request):
-            bundle_path, validation_path = _paths(output_directory, subject_id)
+        for patient_key in self._patient_keys(request):
+            bundle_path, validation_path = _paths(output_directory, patient_key)
+            trace_path = bundle_path.with_name(
+                bundle_path.name.replace(".bundle.json", ".trace.json")
+            )
+            failure_path = bundle_path.with_name(
+                bundle_path.name.replace(".bundle.json", ".failure.json")
+            )
             if request.resume and bundle_path.is_file() and validation_path.is_file():
                 bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
                 report = json.loads(validation_path.read_text(encoding="utf-8"))
-                records.append(
-                    {
-                        "subject_id": subject_id,
-                        "status": "valid" if report.get("valid") else "invalid",
-                        "resumed": True,
-                        "bundle": str(bundle_path),
-                        "validation": str(validation_path),
-                        "resource_counts": _resource_counts(bundle),
-                        "metrics": report.get("metrics", {}),
-                        "validator_issue_counts": report.get(
-                            "validator_issue_counts", {}
-                        ),
-                        "task_evaluation": report.get("metrics", {}).get(
-                            "task_evaluation"
-                        ),
-                    }
+                prior_evaluation = report.get("metrics", {}).get(
+                    "task_evaluation"
                 )
-                _write_json_atomic(manifest_path, manifest())
-                continue
+                task_passed = (
+                    not isinstance(prior_evaluation, dict)
+                    or prior_evaluation.get("task_quality_pass") is True
+                )
+                if report.get("valid") and task_passed:
+                    records.append(
+                        {
+                            "patient_key": patient_key,
+                            "status": "valid",
+                            "resumed": True,
+                            "bundle": str(bundle_path),
+                            "validation": str(validation_path),
+                            "resource_counts": _resource_counts(bundle),
+                            "metrics": report.get("metrics", {}),
+                            "validator_issue_counts": report.get(
+                                "validator_issue_counts", {}
+                            ),
+                            "task_evaluation": prior_evaluation,
+                        }
+                    )
+                    _write_json_atomic(manifest_path, manifest())
+                    continue
             try:
-                result = LlmSqlToFhirPipeline(self._settings).run(subject_id)
+                result = LlmSqlToFhirPipeline(self._settings).run(patient_key)
                 _write_json_atomic(bundle_path, result.fhir_payload)
+                trace_payload = (
+                    result.trace_dict()
+                    if hasattr(result, "trace_dict")
+                    else {"mode": "test-or-external-pipeline", "status": "success"}
+                )
+                _write_json_atomic(trace_path, trace_payload)
     
                 # 디스크에 기록된 실제 산출물을 다시 읽어 독립 검증합니다.
                 persisted_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
@@ -268,12 +326,22 @@ class FhirBatchExportService:
                 _write_json_atomic(validation_path, report)
                 records.append(
                     {
-                        "subject_id": subject_id,
+                        "patient_key": patient_key,
                         "status": "valid" if report["valid"] else "invalid",
                         "resumed": False,
                         "llm_calls_used": result.llm_calls_used,
                         "bundle": str(bundle_path),
                         "validation": str(validation_path),
+                        "trace": str(trace_path),
+                        "source_row_counts": getattr(
+                            result, "source_row_counts", {}
+                        ),
+                        "generation_metrics": getattr(
+                            result, "generation_metrics", {}
+                        ),
+                        "sql_generation_metrics": trace_payload.get(
+                            "sql_generation_metrics", {}
+                        ),
                         "resource_counts": _resource_counts(persisted_bundle),
                         "metrics": report["metrics"],
                         "task_evaluation": task_evaluation,
@@ -283,14 +351,35 @@ class FhirBatchExportService:
                     }
                 )
             except Exception as exc:
-                records.append(
-                    {
-                        "subject_id": subject_id,
+                failure_trace = (
+                    exc.trace_dict()
+                    if isinstance(exc, PipelineExecutionError)
+                    else {
                         "status": "failed",
-                        "resumed": False,
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "failure": {
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        },
                     }
                 )
+                _write_json_atomic(failure_path, failure_trace)
+                records.append({
+                    "patient_key": patient_key,
+                    "status": "failed",
+                    "resumed": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "failure_trace": str(failure_path),
+                    "failure": failure_trace.get("failure"),
+                    "source_row_counts": failure_trace.get(
+                        "source_row_counts", {}
+                    ),
+                    "generation_metrics": failure_trace.get(
+                        "generation_metrics", {}
+                    ),
+                    "sql_generation_metrics": failure_trace.get(
+                        "sql_generation_metrics", {}
+                    ),
+                })
             _write_json_atomic(manifest_path, manifest())
         summary = manifest()
         _write_json_atomic(manifest_path, summary)
@@ -302,9 +391,11 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
 
     output_directory = directory.resolve()
     records: list[dict[str, Any]] = []
-    for bundle_path in sorted(output_directory.glob("subject-*.bundle.json")):
-        subject_text = bundle_path.name.removeprefix("subject-").removesuffix(
-            ".bundle.json"
+    for bundle_path in sorted(output_directory.glob("patient-*.bundle.json")):
+        subject_text = unquote(
+            bundle_path.name.removeprefix("patient-").removesuffix(
+                ".bundle.json"
+            )
         )
         validation_path = bundle_path.with_name(
             bundle_path.name.replace(".bundle.json", ".validation.json")
@@ -328,7 +419,7 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
             _write_json_atomic(validation_path, report)
             records.append(
                 {
-                    "subject_id": int(subject_text),
+                    "patient_key": subject_text,
                     "status": "valid" if report["valid"] else "invalid",
                     "resumed": False,
                     "bundle": str(bundle_path),
@@ -342,7 +433,7 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
         except Exception as exc:
             records.append(
                 {
-                    "subject_id": subject_text,
+                    "patient_key": subject_text,
                     "status": "failed",
                     "resumed": False,
                     "error": f"{type(exc).__name__}: {exc}",

@@ -1,0 +1,16 @@
+{
+  "name": "mimic-iv-2.2",
+  "description": "MIMIC-IV 2.2 PostgreSQL to FHIR R4 source profile",
+  "query_profiles": "../common/clinical_queries.json",
+  "bundle_namespace": "mimic-fhir",
+  "cohort": {
+    "provider": "fhir-patient-ndjson",
+    "patient_file_patterns": [
+      "MimicPatient.ndjson.gz",
+      "fhir/MimicPatient.ndjson.gz",
+      "*/fhir/MimicPatient.ndjson.gz"
+    ],
+    "identifier_system": "http://mimic.mit.edu/fhir/mimic/identifier/patient",
+    "key_type": "integer"
+  }
+}

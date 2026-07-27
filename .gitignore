@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+physionet.org/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+fhir_output/
+fhir_export/
+fhir_export*/
+*.jar
+*.env*
+*.env.example
+
+logs/
+*.json
+
+# 실행에 필요한 데이터 소스 profile과 예시 mapping은 버전 관리합니다.
+!profiles/
+!profiles/**/*.json
+!.env.example

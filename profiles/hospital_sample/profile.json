@@ -1,0 +1,12 @@
+{
+  "name": "hospital-sample",
+  "description": "Example hospital CDW profile demonstrating source-neutral configuration",
+  "query_profiles": "../common/clinical_queries.json",
+  "bundle_namespace": "hospital-sample-fhir",
+  "cohort": {
+    "provider": "none",
+    "patient_file_patterns": [],
+    "identifier_system": "urn:hospital-sample:patient-key",
+    "key_type": "string"
+  }
+}

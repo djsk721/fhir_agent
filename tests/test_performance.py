@@ -197,6 +197,7 @@ def test_aggregate_performance_uses_combined_denominators() -> None:
     assert result["fhir_standard_conformance"][
         "fhir_validation_pass_rate"
     ] == 0.5
+    assert result["strict_end_to_end_pass_rate"] == 0.5
     assert result["source_fidelity"]["source_field_accuracy"] == {
         "correct": 10,
         "evaluated": 12,

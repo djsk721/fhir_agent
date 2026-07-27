@@ -69,3 +69,16 @@ def test_validator_severity_output_is_structured() -> None:
         "[3,4] Bundle: Information - checked"
     )
     assert counts == {"fatal": 0, "error": 1, "warning": 1, "information": 1}
+
+
+def test_bundle_does_not_require_absent_optional_clinical_resources() -> None:
+    bundle = valid_bundle()
+    bundle["entry"] = bundle["entry"][:2]
+    settings = replace(
+        load_settings(require_database=False), fhir_validator_jar=None
+    )
+
+    report = validate_bundle_detailed(bundle, settings)
+
+    assert report.valid
+    assert report.metrics["required_resource_coverage"] == 1.0

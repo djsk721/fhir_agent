@@ -12,15 +12,25 @@ class ResourceAdapter:
     order: int
     dependencies: tuple[str, ...] = ()
     required_fields: tuple[str, ...] = ()
+    source_required: bool = False
+    bundle_required: bool = False
 
 
 RESOURCE_ADAPTERS: tuple[ResourceAdapter, ...] = (
-    ResourceAdapter("Patient", 0, required_fields=("id",)),
+    ResourceAdapter(
+        "Patient",
+        0,
+        required_fields=("id",),
+        source_required=True,
+        bundle_required=True,
+    ),
     ResourceAdapter(
         "Encounter",
         10,
         ("Patient",),
         ("id", "status", "class", "subject"),
+        source_required=True,
+        bundle_required=True,
     ),
     ResourceAdapter(
         "Condition",
@@ -55,15 +65,34 @@ def selected_adapters(resource_types: list[str]) -> list[ResourceAdapter]:
     )
 
 
+def adapter_for(resource_type: str) -> ResourceAdapter:
+    try:
+        return next(
+            adapter
+            for adapter in RESOURCE_ADAPTERS
+            if adapter.resource_type == resource_type
+        )
+    except StopIteration as exc:
+        raise ValueError(
+            f"지원하지 않는 resourceType입니다: {resource_type!r}"
+        ) from exc
+
+
+def required_bundle_resource_types(resource_types: list[str]) -> list[str]:
+    return [
+        adapter.resource_type
+        for adapter in selected_adapters(resource_types)
+        if adapter.bundle_required
+    ]
+
+
 def resource_semantic_errors(resource: dict[str, Any]) -> list[str]:
     """JSON Schema가 빠뜨린 현재 Task의 필수 최상위 필드를 검사합니다."""
 
     resource_type = str(resource.get("resourceType", ""))
-    adapter = next(
-        (item for item in RESOURCE_ADAPTERS if item.resource_type == resource_type),
-        None,
-    )
-    if adapter is None:
+    try:
+        adapter = adapter_for(resource_type)
+    except ValueError:
         return [f"지원하지 않는 resourceType입니다: {resource_type!r}"]
     missing = [
         field_name

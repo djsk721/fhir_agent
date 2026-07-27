@@ -9,10 +9,11 @@ from .fhir_models import build_bundle
 from .evaluation import evaluate_task_output
 from .fhir_schema import get_fhir_schema
 from .llm_query_service import LlmClinicalQueryService, LlmQueryTrace
-from .llm_resource_service import FhirLlmResourceService
-from .mapping_config import MimicMappingConfig
+from .llm_resource_service import FhirGenerationError, FhirLlmResourceService
 from .performance import build_performance_metrics
 from .resource_registry import selected_adapters
+from .source_profile import SourceProfile
+from .sql_agent import SqlGenerationError
 from .validation import ValidationReport, validate_bundle_detailed
 from .vector_store import PgVectorKnowledgeStore
 
@@ -56,6 +57,47 @@ class LlmFhirPipelineResult:
         }
 
 
+class PipelineExecutionError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_type: str | None,
+        cause: Exception,
+        query_traces: list[LlmQueryTrace],
+        source_row_counts: dict[str, int],
+        generation_metrics: dict[str, dict[str, int | float]],
+    ) -> None:
+        super().__init__(message)
+        self.resource_type = resource_type
+        self.cause = cause
+        self.query_traces = list(query_traces)
+        self.source_row_counts = dict(source_row_counts)
+        self.generation_metrics = dict(generation_metrics)
+
+    def trace_dict(self) -> dict[str, Any]:
+        failure: dict[str, Any] = {
+            "resource_type": self.resource_type,
+            "error_type": type(self.cause).__name__,
+            "message": str(self.cause),
+        }
+        if isinstance(self.cause, SqlGenerationError):
+            failure["sql_attempts"] = [
+                asdict(item) for item in self.cause.attempts
+            ]
+        if isinstance(self.cause, FhirGenerationError):
+            failure["fhir_generation"] = self.cause.as_dict()
+        return {
+            "mode": "llm-sql-and-llm-fhir",
+            "status": "failed",
+            "failure": failure,
+            "source_row_counts": self.source_row_counts,
+            "generation_metrics": self.generation_metrics,
+            "sql_generation_metrics": _sql_metrics(self.query_traces),
+            "queries": [asdict(item) for item in self.query_traces],
+        }
+
+
 class LlmSqlToFhirPipeline:
     """LLM SQL 조회와 LLM FHIR 생성 서비스를 순서대로 조정합니다."""
 
@@ -66,11 +108,10 @@ class LlmSqlToFhirPipeline:
         resource_service: FhirLlmResourceService | None = None,
     ) -> None:
         self.settings = settings
-        mapping = MimicMappingConfig.load(settings.mimic_mapping_config_path)
-        self.mapping = mapping
+        self.profile = SourceProfile.load(settings.source_profile_path)
         schema = get_fhir_schema(settings.fhir_schema_path)
         self.query_service = query_service or LlmClinicalQueryService(
-            settings, mapping
+            settings, profile=self.profile
         )
         if resource_service is None:
             vector_store = None
@@ -81,7 +122,6 @@ class LlmSqlToFhirPipeline:
                 self._require_vector_tables(vector_store)
             self.resource_service = FhirLlmResourceService(
                 settings,
-                mapping,
                 schema,
                 FhirResourceGenerationAgent(settings),
                 vector_store,
@@ -99,16 +139,27 @@ class LlmSqlToFhirPipeline:
                 not report.get("exists")
                 or not report.get("compatible")
                 or int(report.get("rows", 0)) < 1
+                or (
+                    table_name == self.settings.sql_vector_table
+                    and int(report.get("current_profile_rows", 0)) < 1
+                )
+                or (
+                    table_name == self.settings.fhir_vector_table
+                    and int(report.get("global_rows", 0)) < 1
+                )
             ):
                 raise RuntimeError(
                     f"LLM 변환에 필요한 VectorDB가 준비되지 않았습니다: "
-                    f"{report.get('table', table_name)}. build-vectors를 실행하세요."
+                    f"{report.get('table', table_name)} "
+                    f"(profile={self.profile.name}, "
+                    f"fingerprint={self.profile.fingerprint[:12]}). "
+                    "build-vectors를 실행하세요."
                 )
 
     def run(
         self,
-        subject_id: int,
-        admission_id: int | None = None,
+        patient_key: int | str,
+        encounter_key: int | str | None = None,
     ) -> LlmFhirPipelineResult:
         generated: list[dict[str, Any]] = []
         traces: list[LlmQueryTrace] = []
@@ -117,26 +168,28 @@ class LlmSqlToFhirPipeline:
         generation_metrics: dict[str, dict[str, int | float]] = {}
         source_rows: dict[str, list[dict[str, Any]]] = {}
         generated_by_type: dict[str, list[dict[str, Any]]] = {}
-        admission_ids: list[int] = []
+        encounter_keys: list[int | str] = []
         total_calls = 0
+        current_resource_type: str | None = None
 
         try:
             for adapter in selected_adapters(self.settings.fhir_output_resources):
+                current_resource_type = adapter.resource_type
                 queried = self.query_service.query(
                     adapter.resource_type,
-                    subject_id,
-                    admission_ids,
-                    admission_id,
+                    patient_key,
+                    encounter_keys,
+                    encounter_key,
                 )
                 traces.append(queried.trace)
                 source_counts[adapter.resource_type] = len(queried.rows)
                 source_rows[adapter.resource_type] = queried.rows
                 total_calls += queried.trace.llm_calls_used
                 if adapter.resource_type == "Encounter":
-                    admission_ids = self.query_service.admission_ids(queried.rows)
+                    encounter_keys = self.query_service.encounter_ids(queried.rows)
 
                 generation_result = self.resource_service.generate(
-                    adapter.resource_type, queried.rows, subject_id
+                    adapter.resource_type, queried.rows, patient_key
                 )
                 generation_calls[adapter.resource_type] = (
                     generation_result.llm_calls_used
@@ -149,13 +202,23 @@ class LlmSqlToFhirPipeline:
                     generation_result.resources
                 )
                 generated.extend(generation_result.resources)
+        except Exception as exc:
+            raise PipelineExecutionError(
+                f"{current_resource_type or 'Pipeline'} 처리 실패: {exc}",
+                resource_type=current_resource_type,
+                cause=exc,
+                query_traces=traces,
+                source_row_counts=source_counts,
+                generation_metrics=generation_metrics,
+            ) from exc
         finally:
             self.query_service.close()
 
-        bundle = build_bundle(generated)
+        bundle = build_bundle(
+            generated, namespace=self.profile.bundle_namespace
+        )
         report = validate_bundle_detailed(bundle, self.settings)
         task_evaluation = evaluate_task_output(
-            self.mapping,
             source_rows,
             generated_by_type,
             self.settings.fhir_default_timezone,
@@ -195,6 +258,9 @@ def _sql_metrics(traces: list[LlmQueryTrace]) -> dict[str, int | float]:
     ]
     safety_rejections = categories.count("safety_policy")
     database_failures = categories.count("database_execution")
+    result_validation_failures = sum(
+        category.startswith("result_") for category in categories
+    )
     safety_checks = len(traces) + safety_rejections + database_failures
     return {
         "queries": len(traces),
@@ -208,6 +274,22 @@ def _sql_metrics(traces: list[LlmQueryTrace]) -> dict[str, int | float]:
         "response_format_failures": categories.count("response_format"),
         "safety_policy_rejections": safety_rejections,
         "database_execution_failures": database_failures,
+        "result_validation_failures": result_validation_failures,
+        "result_empty_required_failures": categories.count(
+            "result_empty_required"
+        ),
+        "result_required_column_failures": categories.count(
+            "result_required_columns"
+        ),
+        "result_scope_failures": sum(
+            category in {"result_patient_scope", "result_encounter_scope"}
+            for category in categories
+        ),
+        "rag_requested_queries": sum(item.rag_requested for item in traces),
+        "rag_used_queries": sum(item.rag_used for item in traces),
+        "retrieved_documents": sum(
+            item.retrieved_document_count for item in traces
+        ),
         "sql_safety_pass_rate": (
             1.0
             if not safety_checks

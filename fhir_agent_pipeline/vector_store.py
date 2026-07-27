@@ -8,11 +8,11 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 from .config import Settings
-from .db import build_engine, quote_identifier
+from .db import build_engine, SourceSchemaCatalog, quote_identifier
 from .fhir_schema import get_fhir_schema
 from .json_utils import dump_json
-from .mapping_config import MimicMappingConfig
 from .ollama import OllamaClient
+from .source_profile import SourceProfile
 
 
 def _vector_literal(vector: list[float]) -> str:
@@ -32,6 +32,7 @@ class PgVectorKnowledgeStore:
 
     def __init__(self, settings: Settings, engine: Engine | None = None) -> None:
         self.settings = settings
+        self.profile = SourceProfile.load(settings.source_profile_path)
         self.engine = engine or build_engine(settings)
         self.embeddings = OllamaClient(
             settings.ollama_base_url,
@@ -109,13 +110,38 @@ class PgVectorKnowledgeStore:
                     ORDER BY indexname
                 """), {"schema": self.settings.vector_schema, "table": table_name})
             ]
+            profile_counts = connection.execute(
+                text(
+                    f"SELECT "
+                    f"count(*) FILTER (WHERE metadata->>'profile_fingerprint' = :fingerprint), "
+                    f"count(*) FILTER (WHERE metadata->>'profile' = '__global__') "
+                    f"FROM {self._qualified(table_name)}"
+                ),
+                {"fingerprint": self.profile.fingerprint},
+            ).one()
+            report["current_profile_rows"] = int(profile_counts[0])
+            report["global_rows"] = int(profile_counts[1])
         report["compatible"] = self.required_columns.issubset(report["columns"])
         return report
 
     def ensure_vector_index(self, table_name: str) -> None:
         """cosine 검색용 HNSW 인덱스를 안전하게 추가합니다."""
-        index_name = quote_identifier(f"{table_name}_embedding_hnsw")
         with self.engine.begin() as connection:
+            table_oid = int(
+                connection.execute(
+                    text(
+                        "SELECT CAST(to_regclass(:table) AS oid)"
+                    ),
+                    {
+                        "table": (
+                            f"{self.settings.vector_schema}.{table_name}"
+                        )
+                    },
+                ).scalar_one()
+            )
+            index_name = quote_identifier(
+                f"{table_name[:35]}_embedding_hnsw_{table_oid}"
+            )
             connection.execute(text(
                 f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._qualified(table_name)} "
                 "USING hnsw (embedding vector_cosine_ops)"
@@ -220,40 +246,69 @@ class PgVectorKnowledgeStore:
     ) -> int:
         """현재 생성 대상에서 빠진 이전 스키마/매핑 문서를 제거합니다."""
         docs = list(documents)
-        sources = sorted({
-            str(doc.metadata["source"])
-            for doc in docs
-            if doc.metadata.get("source") is not None
-        })
+        profiles = sorted(
+            {
+                str(doc.metadata["profile"])
+                for doc in docs
+                if doc.metadata.get("profile") is not None
+            }
+        )
+        kinds = sorted(
+            {
+                str(doc.metadata["kind"])
+                for doc in docs
+                if doc.metadata.get("kind") is not None
+            }
+        )
         hashes = [hashlib.sha256(doc.content.encode("utf-8")).hexdigest() for doc in docs]
-        if not sources or not hashes:
+        if not profiles or not kinds or not hashes:
             return 0
         with self.engine.begin() as connection:
             result = connection.execute(
                 text(
                     f"DELETE FROM {self._qualified(table_name)} "
-                    "WHERE metadata->>'source' = ANY(:sources) "
+                    "WHERE metadata->>'profile' = ANY(:profiles) "
+                    "AND metadata->>'kind' = ANY(:kinds) "
                     "AND NOT (content_hash = ANY(:hashes))"
                 ),
-                {"sources": sources, "hashes": hashes},
+                {
+                    "profiles": profiles,
+                    "kinds": kinds,
+                    "hashes": hashes,
+                },
             )
         return int(result.rowcount or 0)
 
-    def search(self, table_name: str, query: str, k: int | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        table_name: str,
+        query: str,
+        k: int | None = None,
+        *,
+        profile_scoped: bool = True,
+    ) -> list[dict[str, Any]]:
         report = self.inspect_table(table_name)
         if not report["exists"] or not report["compatible"]:
             return []
         vector = self.embeddings.embed_query(query)
         limit = k or self.settings.vector_search_k
+        profile_filter = (
+            "WHERE (metadata->>'profile' = '__global__' "
+            "OR metadata->>'profile_fingerprint' = :profile_fingerprint)"
+            if profile_scoped
+            else ""
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(text(f"""
                 SELECT content, metadata, 1 - (embedding <=> CAST(:embedding AS vector)) AS similarity
                 FROM {self._qualified(table_name)}
+                {profile_filter}
                 ORDER BY embedding <=> CAST(:embedding AS vector)
                 LIMIT :limit
             """), {
                 "embedding": _vector_literal(vector),
                 "limit": limit,
+                "profile_fingerprint": self.profile.fingerprint,
             }).mappings()
             return [dict(row) for row in rows]
 
@@ -273,6 +328,7 @@ def fhir_schema_documents(settings: Settings) -> list[KnowledgeDocument]:
             "source": str(settings.fhir_schema_path),
             "definition": name,
             "kind": "overview",
+            "profile": "__global__",
         }))
         for prop_name, prop in properties.items():
             ref = prop.get("$ref") or prop.get("items", {}).get("$ref", "")
@@ -293,117 +349,36 @@ def fhir_schema_documents(settings: Settings) -> list[KnowledgeDocument]:
                 "definition": name,
                 "property": prop_name,
                 "kind": "property",
+                "profile": "__global__",
             }))
     return documents
 
 
-def database_schema_documents(settings: Settings, engine: Engine | None = None) -> list[KnowledgeDocument]:
+def database_schema_documents(
+    settings: Settings,
+    engine: Engine | None = None,
+    catalog: SourceSchemaCatalog | None = None,
+) -> list[KnowledgeDocument]:
     engine = engine or build_engine(settings)
-    inspector = inspect(engine)
+    profile = SourceProfile.load(settings.source_profile_path)
+    catalog = catalog or SourceSchemaCatalog.load(settings, engine)
     documents: list[KnowledgeDocument] = []
-    for schema in settings.allowed_schemas:
-        available = set(inspector.get_table_names(schema=schema))
-        for table_name in settings.allowed_tables:
-            if table_name not in available:
-                continue
-            columns = inspector.get_columns(table_name, schema=schema)
-            pk = set((inspector.get_pk_constraint(table_name, schema=schema) or {}).get("constrained_columns") or [])
-            foreign_keys = inspector.get_foreign_keys(table_name, schema=schema)
-            column_text = ", ".join(
-                f"{column['name']} {column['type']}"
-                f"{' PRIMARY KEY' if column['name'] in pk else ''}"
-                for column in columns
-            )
-            fk_text = "; ".join(
-                f"{','.join(foreign_key.get('constrained_columns') or [])} -> "
-                f"{foreign_key.get('referred_schema') or schema}."
-                f"{foreign_key.get('referred_table')}"
-                f"({','.join(foreign_key.get('referred_columns') or [])})"
-                for foreign_key in foreign_keys
-            )
-            content = (
-                f"PostgreSQL table {schema}.{table_name}\n"
-                f"Columns: {column_text}\n"
-                f"Foreign keys: {fk_text or 'none'}"
-            )
-            documents.append(KnowledgeDocument(content, {
-                "source": "postgresql",
-                "schema": schema,
-                "table": table_name,
-                "kind": "table_schema",
-            }))
+    for table in catalog.tables:
+        documents.append(KnowledgeDocument(table.schema_text(), {
+            "source": "postgresql",
+            "schema": table.schema,
+            "table": table.name,
+            "kind": "table_schema",
+            "profile": profile.name,
+            "profile_fingerprint": profile.fingerprint,
+        }))
     return documents
-
-
-def mapping_profile_documents(settings: Settings) -> list[KnowledgeDocument]:
-    mapping = MimicMappingConfig.load(settings.mimic_mapping_config_path)
-    source_columns = {
-        "patient": mapping.patient_columns.values,
-        "admission": mapping.admission_columns.values,
-        "lab_event": mapping.lab_columns.values,
-        "diagnosis": mapping.diagnosis_columns.values,
-        "procedure": mapping.procedure_columns.values,
-    }
-    encounter_rules = {
-        "class_system": mapping.encounter_class_system,
-        "default_class": mapping.encounter_default_class,
-        "class_by_admission_type": mapping.encounter_class_by_type,
-        "status_when_ended": mapping.encounter_status_when_ended,
-        "status_when_open": mapping.encounter_status_when_open,
-    }
-    identifiers = {
-        "patient": mapping.patient_identifier_system,
-        "encounter": mapping.encounter_identifier_system,
-        "lab_item": mapping.lab_item_system,
-        "lab_event": mapping.lab_event_identifier_system,
-        "condition": mapping.condition_identifier_system,
-        "procedure": mapping.procedure_identifier_system,
-        "resource_id_rules": mapping.resource_id_rules,
-        "patient_gender_map": mapping.patient_gender_map,
-        "default_timezone": settings.fhir_default_timezone,
-    }
-    terminology = {
-        "diagnosis_icd_systems": mapping.diagnosis_icd_systems,
-        "procedure_icd_systems": mapping.procedure_icd_systems,
-        "diagnosis_decimal_positions": mapping.diagnosis_decimal_positions,
-        "procedure_decimal_positions": mapping.procedure_decimal_positions,
-        "diagnosis_prefix_decimal_positions": mapping.diagnosis_prefix_decimal_positions,
-        "procedure_prefix_decimal_positions": mapping.procedure_prefix_decimal_positions,
-        "fhir_defaults": mapping.fhir_defaults,
-    }
-    common = {"source": str(mapping.source_path), "kind": "mimic_mapping_profile"}
-    return [
-        KnowledgeDocument(
-            "MIMIC logical-to-physical source columns:\n" + dump_json(source_columns),
-            {**common, "section": "source_columns"},
-        ),
-        KnowledgeDocument(
-            "MIMIC admission_type to FHIR Encounter mapping:\n"
-            + dump_json(encounter_rules),
-            {**common, "section": "encounter"},
-        ),
-        KnowledgeDocument(
-            "MIMIC FHIR identifier and timezone policy:\n" + dump_json(identifiers),
-            {**common, "section": "identifiers_and_timezone"},
-        ),
-        KnowledgeDocument(
-            "MIMIC diagnosis and procedure ICD terminology policy:\n" + dump_json(terminology),
-            {**common, "section": "icd_terminology"},
-        ),
-    ]
 
 
 def build_knowledge_bases(settings: Settings) -> dict[str, Any]:
     store = PgVectorKnowledgeStore(settings)
-    mapping_docs = mapping_profile_documents(settings)
-    fhir_docs = [*fhir_schema_documents(settings), *mapping_docs]
+    fhir_docs = fhir_schema_documents(settings)
     sql_docs = database_schema_documents(settings, store.engine)
-    sql_profile_sections = {"source_columns", "icd_terminology"}
-    sql_docs.extend(
-        doc
-        for doc in mapping_docs
-        if doc.metadata.get("section") in sql_profile_sections
-    )
     fhir_stats = store.upsert(settings.fhir_vector_table, fhir_docs)
     sql_stats = store.upsert(settings.sql_vector_table, sql_docs)
     pruned = {

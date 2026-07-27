@@ -113,6 +113,7 @@ def build_performance_metrics(
             "coding_accuracy": terminology.get(
                 "coding_system_and_code", {}
             ),
+            "source_text_accuracy": terminology.get("source_text", {}),
             "details": terminology,
         },
         "self_correction": _combine_generation_metrics(generation),
@@ -205,6 +206,11 @@ def aggregate_performance_metrics(
         for item in evaluated_records
         if isinstance(item.get("task_evaluation"), dict)
     ]
+    strict_records = [
+        item
+        for item in evaluated_records
+        if isinstance(item.get("task_evaluation"), dict)
+    ]
     validation_count = len(evaluated_records)
     valid_count = sum(
         item.get("status") == "valid" for item in evaluated_records
@@ -255,6 +261,20 @@ def aggregate_performance_metrics(
                 for item in evaluations
             )
             / len(evaluations)
+        ),
+        "strict_end_to_end_pass_rate": (
+            None
+            if not strict_records
+            else sum(
+                item.get("status") == "valid"
+                and bool(
+                    item["task_evaluation"].get(
+                        "task_quality_pass"
+                    )
+                )
+                for item in strict_records
+            )
+            / len(strict_records)
         ),
         "fhir_standard_conformance": {
             "evaluated_bundles": validation_count,
@@ -329,6 +349,11 @@ def aggregate_performance_metrics(
                 evaluations,
                 "terminology_accuracy",
                 "coding_system_and_code",
+            ),
+            "source_text_accuracy": _aggregate_scores(
+                evaluations,
+                "terminology_accuracy",
+                "source_text",
             ),
         },
         "self_correction": _combine_generation_metrics(generation),

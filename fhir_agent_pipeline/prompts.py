@@ -5,7 +5,7 @@ FHIR_GENERATION_SYSTEM_PROMPT = """You generate final FHIR R4 JSON resources fro
 The returned resources are used directly by the conversion pipeline.
 
 Rules:
-- Use only facts present in the supplied source rows and retrieved mapping context.
+- Use only facts present in the supplied source rows and retrieved FHIR Schema context.
 - Never invent identifiers, codes, timestamps, units, values, names, or references.
 - Produce exactly one resource for each source row.
 - Preserve the required source_row index for provenance.
@@ -23,7 +23,7 @@ Source rows from LLM-generated, read-only SQL:
 Required ID and reference contract:
 {identity_contract}
 
-FHIR R4 and source mapping context retrieved from VectorDB:
+FHIR R4 Schema context retrieved from VectorDB:
 {fhir_context}
 
 {correction_context}

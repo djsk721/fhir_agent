@@ -11,7 +11,7 @@ from typing import Any, Callable
 from sqlalchemy import text
 
 from .config import Settings, load_settings
-from .db import build_engine
+from .db import build_engine, SourceSchemaCatalog
 from .export_service import (
     ExportRequest,
     FhirBatchExportService,
@@ -45,8 +45,8 @@ def _save_conversion(
 
 
 def convert(
-    subject_id: int | str | None = None,
-    admission_id: int | str | None = None,
+    patient_key: int | str | None = None,
+    encounter_key: int | str | None = None,
 ) -> dict[str, Any]:
     settings = load_settings()
     profile = SourceProfile.load(settings.source_profile_path)
@@ -56,17 +56,17 @@ def convert(
             return value
         return int(value) if profile.cohort.key_type == "integer" else value
 
-    selected_subject_id = (
-        normalize(subject_id)
-        if subject_id is not None
-        else settings.patient_subject_id
+    selected_patient_key = (
+        normalize(patient_key)
+        if patient_key is not None
+        else settings.source_patient_id
     )
-    if selected_subject_id is None:
+    if selected_patient_key is None:
         raise ValueError(
-            "LLM 변환에는 --subject-id 또는 SOURCE_PATIENT_ID가 필요합니다."
+            "LLM 변환에는 --patient-key 또는 SOURCE_PATIENT_ID가 필요합니다."
         )
     result = LlmSqlToFhirPipeline(settings).run(
-        selected_subject_id, normalize(admission_id)
+        selected_patient_key, normalize(encounter_key)
     )
     generation_mode = "llm-sql-and-llm-fhir"
     trace = result.trace_dict()
@@ -132,8 +132,30 @@ def _database_diagnostic(settings: Settings) -> str | dict[str, Any]:
     if not settings.source_db_url:
         return "not configured"
     try:
-        with build_engine(settings).connect() as connection:
-            return str(connection.execute(text("SELECT current_database()")).scalar_one())
+        engine = build_engine(settings)
+        try:
+            with engine.connect() as connection:
+                database = str(
+                    connection.execute(text("SELECT current_database()")).scalar_one()
+                )
+            catalog = SourceSchemaCatalog.load(settings, engine)
+            return {
+                "status": "connected",
+                "database": database,
+                "excluded_schemas": [
+                    "public",
+                    "information_schema",
+                    "pg_*",
+                ],
+                "discovered_schemas": sorted(catalog.schemas),
+                "table_selection": "all-non-public-user-schemas",
+                "discovered_table_count": len(catalog.tables),
+                "discovered_tables": [
+                    table.qualified_name for table in catalog.tables
+                ],
+            }
+        finally:
+            engine.dispose()
     except ModuleNotFoundError as exc:
         return {
             "status": "connection failed",
@@ -160,8 +182,6 @@ def doctor() -> dict[str, Any]:
         "source_profile_exists": settings.source_profile_path.is_file(),
         "fhir_schema_path": str(settings.fhir_schema_path),
         "fhir_schema_exists": settings.fhir_schema_path.is_file(),
-        "source_mapping_config": str(settings.source_mapping_config_path),
-        "source_mapping_config_exists": settings.source_mapping_config_path.is_file(),
         "fhir_default_timezone": settings.fhir_default_timezone,
         "source_data_path": str(settings.source_data_path),
         "cohort_patient_file": demo_patient_file,
@@ -180,25 +200,25 @@ def doctor() -> dict[str, Any]:
 
 def export_validate(
     *,
-    subject_ids: list[int | str] | None,
+    patient_keys: list[int | str] | None,
     limit: int | None,
-    all_demo_patients: bool,
+    all_cohort_patients: bool,
     output_directory: str | None,
     resume: bool,
 ) -> dict[str, Any]:
     settings = load_settings()
     profile = SourceProfile.load(settings.source_profile_path)
-    normalized_subject_ids = tuple(
+    normalized_patient_keys = tuple(
         int(value) if profile.cohort.key_type == "integer" else str(value)
-        for value in (subject_ids or ())
+        for value in (patient_keys or ())
     )
     request = ExportRequest(
         output_directory=(
             Path(output_directory) if output_directory else settings.fhir_export_directory
         ),
-        subject_ids=normalized_subject_ids,
+        patient_keys=normalized_patient_keys,
         limit=limit,
-        all_demo_patients=all_demo_patients,
+        all_cohort_patients=all_cohort_patients,
         resume=resume,
     )
     output = FhirBatchExportService(settings).run(request)
@@ -218,7 +238,7 @@ def validate_export(path: str | None) -> dict[str, Any]:
     )
     _print_json(output)
     if not output["attempted_patients"]:
-        raise RuntimeError("검증할 subject-*.bundle.json 파일이 없습니다.")
+        raise RuntimeError("검증할 patient-*.bundle.json 파일이 없습니다.")
     if output["invalid_patients"] or output["failed_patients"]:
         raise RuntimeError(
             "재검증 실패: "
@@ -257,8 +277,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
     convert_parser = commands.add_parser("convert", help="환자 1명의 FHIR Bundle 생성")
-    convert_parser.add_argument("--subject-id")
-    convert_parser.add_argument("--encounter-id", "--hadm-id", dest="hadm_id")
+    convert_parser.add_argument("--patient-key")
+    convert_parser.add_argument("--encounter-key")
     ask_parser = commands.add_parser("ask", help="자연어 질문을 안전한 SELECT로 조회")
     ask_parser.add_argument("question")
     commands.add_parser(
@@ -275,16 +295,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     selectors = export_parser.add_mutually_exclusive_group(required=True)
     selectors.add_argument(
-        "--subject-id", action="append", dest="subject_ids",
+        "--patient-key", action="append", dest="patient_keys",
         help="특정 환자 ID. 여러 번 지정 가능",
     )
     selectors.add_argument(
         "--limit", type=int,
-        help="demo Patient NDJSON 순서에서 처리할 환자 수",
+        help="source profile cohort 순서에서 처리할 환자 수",
     )
     selectors.add_argument(
-        "--all", action="store_true", dest="all_demo_patients",
-        help="demo Patient NDJSON에 포함된 모든 환자를 처리",
+        "--all", action="store_true", dest="all_cohort_patients",
+        help="source profile cohort에 포함된 모든 환자를 처리",
     )
     export_parser.add_argument("--output-dir")
     export_parser.add_argument("--resume", action="store_true")
@@ -305,8 +325,8 @@ def main() -> Any:
     args = build_parser().parse_args()
     handlers: dict[str, Callable[[], Any]] = {
         "convert": lambda: convert(
-            getattr(args, "subject_id", None),
-            getattr(args, "hadm_id", None),
+            getattr(args, "patient_key", None),
+            getattr(args, "encounter_key", None),
         ),
         "ask": lambda: ask(args.question),
         "build-vectors": build_vectors,
@@ -314,9 +334,9 @@ def main() -> Any:
         "validate": lambda: validate_file(args.path),
         "doctor": doctor,
         "export-validate": lambda: export_validate(
-            subject_ids=args.subject_ids,
+            patient_keys=args.patient_keys,
             limit=args.limit,
-            all_demo_patients=args.all_demo_patients,
+            all_cohort_patients=args.all_cohort_patients,
             output_directory=args.output_dir,
             resume=args.resume,
         ),

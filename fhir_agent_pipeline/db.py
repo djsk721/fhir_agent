@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
+from typing import Any
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
 
 from .config import Settings
@@ -12,15 +14,15 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def build_engine(settings: Settings) -> Engine:
-    """설정된 별도 MIMIC PostgreSQL 서버의 SQLAlchemy 엔진을 만듭니다."""
+    """설정된 별도 원천 PostgreSQL 서버의 SQLAlchemy 엔진을 만듭니다."""
 
     connect_args = (
         {"connect_timeout": settings.db_connect_timeout_seconds}
-        if settings.mimic_db_url.startswith("postgresql")
+        if settings.source_db_url.startswith("postgresql")
         else {}
     )
     return create_engine(
-        settings.mimic_db_url,
+        settings.source_db_url,
         future=True,
         pool_pre_ping=True,
         connect_args=connect_args,
@@ -36,3 +38,198 @@ def quote_identifier(value: str) -> str:
 def qualified_table(schema: str, table: str) -> str:
     return f"{quote_identifier(schema)}.{quote_identifier(table)}"
 
+
+@dataclass(frozen=True)
+class SourceColumn:
+    name: str
+    data_type: str
+    primary_key: bool
+
+
+@dataclass(frozen=True)
+class SourceForeignKey:
+    columns: tuple[str, ...]
+    referred_schema: str
+    referred_table: str
+    referred_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceTable:
+    schema: str
+    name: str
+    columns: tuple[SourceColumn, ...]
+    foreign_keys: tuple[SourceForeignKey, ...]
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def column_names(self) -> tuple[str, ...]:
+        return tuple(column.name for column in self.columns)
+
+    def schema_text(self) -> str:
+        columns = ", ".join(
+            f"{column.name} {column.data_type}"
+            f"{' PRIMARY KEY' if column.primary_key else ''}"
+            for column in self.columns
+        )
+        foreign_keys = "; ".join(
+            f"{','.join(key.columns)} -> "
+            f"{key.referred_schema}.{key.referred_table}"
+            f"({','.join(key.referred_columns)})"
+            for key in self.foreign_keys
+        )
+        return (
+            f"PostgreSQL table {self.qualified_name}\n"
+            f"Columns: {columns}\n"
+            f"Foreign keys: {foreign_keys or 'none'}"
+        )
+
+
+@dataclass(frozen=True)
+class SourceSchemaCatalog:
+    """SQL 허용, RAG 문서와 Self-Correction이 공유하는 DB metadata snapshot."""
+
+    tables: tuple[SourceTable, ...]
+
+    @classmethod
+    def load(cls, settings: Settings, engine: Engine) -> "SourceSchemaCatalog":
+        inspector = inspect(engine)
+        tables: list[SourceTable] = []
+        schemas = [
+            schema
+            for schema in inspector.get_schema_names()
+            if schema.lower() not in {"public", "information_schema"}
+            and not schema.lower().startswith("pg_")
+        ]
+        for schema in schemas:
+            for table_name in inspector.get_table_names(schema=schema):
+                raw_columns = inspector.get_columns(table_name, schema=schema)
+                primary_key = set(
+                    (
+                        inspector.get_pk_constraint(table_name, schema=schema)
+                        or {}
+                    ).get("constrained_columns")
+                    or []
+                )
+                raw_foreign_keys: list[dict[str, Any]] = (
+                    inspector.get_foreign_keys(table_name, schema=schema)
+                )
+                tables.append(
+                    SourceTable(
+                        schema=schema,
+                        name=table_name,
+                        columns=tuple(
+                            SourceColumn(
+                                name=str(column["name"]),
+                                data_type=str(column["type"]),
+                                primary_key=column["name"] in primary_key,
+                            )
+                            for column in raw_columns
+                        ),
+                        foreign_keys=tuple(
+                            SourceForeignKey(
+                                columns=tuple(
+                                    str(value)
+                                    for value in key.get(
+                                        "constrained_columns"
+                                    )
+                                    or []
+                                ),
+                                referred_schema=str(
+                                    key.get("referred_schema") or schema
+                                ),
+                                referred_table=str(key.get("referred_table")),
+                                referred_columns=tuple(
+                                    str(value)
+                                    for value in key.get(
+                                        "referred_columns"
+                                    )
+                                    or []
+                                ),
+                            )
+                            for key in raw_foreign_keys
+                        ),
+                    )
+                )
+        return cls(tuple(sorted(tables, key=lambda item: item.qualified_name)))
+
+    @property
+    def relations(self) -> tuple[tuple[str, str], ...]:
+        return tuple((table.schema, table.name) for table in self.tables)
+
+    @property
+    def table_names(self) -> frozenset[str]:
+        return frozenset(table.name.lower() for table in self.tables)
+
+    @property
+    def schemas(self) -> frozenset[str]:
+        return frozenset(table.schema.lower() for table in self.tables)
+
+    @property
+    def relation_names(self) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (table.schema.lower(), table.name.lower()) for table in self.tables
+        )
+
+    def get(self, schema: str, table: str) -> SourceTable | None:
+        key = (schema.lower(), table.lower())
+        return next(
+            (
+                item
+                for item in self.tables
+                if (item.schema.lower(), item.name.lower()) == key
+            ),
+            None,
+        )
+
+    def schema_hint(
+        self, relations: set[tuple[str, str]]
+    ) -> str:
+        selected = [
+            table
+            for schema, name in sorted(relations)
+            if (table := self.get(schema, name)) is not None
+        ]
+        selected_names = {
+            (table.schema.lower(), table.name.lower()) for table in selected
+        }
+        selected_columns = {
+            column.lower()
+            for table in selected
+            for column in table.column_names
+        }
+        related = sorted(
+            (
+                table
+                for table in self.tables
+                if (table.schema.lower(), table.name.lower()) not in selected_names
+                and len(
+                    selected_columns
+                    & {column.lower() for column in table.column_names}
+                ) >= 2
+            ),
+            key=lambda table: (
+                -max(
+                    (
+                        len(
+                            set(re.split(r"[_\W]+", selected_table.name.lower()))
+                            & set(re.split(r"[_\W]+", table.name.lower()))
+                        )
+                        for selected_table in selected
+                    ),
+                    default=0,
+                ),
+                -len(
+                    selected_columns
+                    & {column.lower() for column in table.column_names}
+                ),
+                table.qualified_name,
+            ),
+        )[:10]
+        return "\n".join(
+            f"{table.qualified_name}: {', '.join(table.column_names)}"
+            for table in [*selected, *related]
+        )

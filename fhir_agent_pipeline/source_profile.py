@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from string import Formatter
@@ -9,11 +10,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class QueryProfile:
-    """FHIR 리소스 하나의 원천 테이블 역할과 LLM SQL 질문 템플릿."""
+    """FHIR 리소스 하나의 동적 스키마 탐색용 LLM SQL 질문 템플릿."""
 
-    source_table_role: str
     template: str
-    dictionary_table_role: str | None = None
 
     def render(self, values: dict[str, Any]) -> str:
         placeholders = {
@@ -41,13 +40,11 @@ class CohortProfile:
 
 @dataclass(frozen=True)
 class SourceProfile:
-    """병원별 DB 구조·조회·식별 정책을 공통 Pipeline 밖에서 관리합니다."""
+    """병원별 스키마·조회·식별 정책을 공통 Pipeline 밖에서 관리합니다."""
 
     name: str
     description: str
-    database_schema: str
-    tables: dict[str, str]
-    mapping_path: Path
+    query_path: Path
     query_profiles: dict[str, QueryProfile]
     bundle_namespace: str
     cohort: CohortProfile
@@ -61,20 +58,11 @@ class SourceProfile:
         payload = json.loads(resolved.read_text(encoding="utf-8"))
         base = resolved.parent
         query_path = (base / str(payload["query_profiles"])).resolve()
-        mapping_path = (base / str(payload["mapping"])).resolve()
         if not query_path.is_file():
             raise FileNotFoundError(f"query profile 파일을 찾을 수 없습니다: {query_path}")
-        if not mapping_path.is_file():
-            raise FileNotFoundError(f"mapping 파일을 찾을 수 없습니다: {mapping_path}")
         query_payload = json.loads(query_path.read_text(encoding="utf-8"))
         queries = {
             str(resource_type): QueryProfile(
-                source_table_role=str(value["source_table_role"]),
-                dictionary_table_role=(
-                    str(value["dictionary_table_role"])
-                    if value.get("dictionary_table_role")
-                    else None
-                ),
                 template=str(value["template"]),
             )
             for resource_type, value in query_payload.items()
@@ -83,12 +71,7 @@ class SourceProfile:
         profile = cls(
             name=str(payload["name"]),
             description=str(payload.get("description", "")),
-            database_schema=str(payload["database"]["schema"]),
-            tables={
-                str(role): str(table)
-                for role, table in payload["database"]["tables"].items()
-            },
-            mapping_path=mapping_path,
+            query_path=query_path,
             query_profiles=queries,
             bundle_namespace=str(
                 payload.get("bundle_namespace", payload["name"])
@@ -112,18 +95,11 @@ class SourceProfile:
         return profile
 
     def _validate(self) -> None:
-        required_roles = {
-            query.source_table_role
-            for query in self.query_profiles.values()
-        } | {
-            query.dictionary_table_role
-            for query in self.query_profiles.values()
-            if query.dictionary_table_role
-        }
-        missing_roles = required_roles - set(self.tables)
-        if missing_roles:
+        supported_providers = {"none", "fhir-patient-ndjson"}
+        if self.cohort.provider not in supported_providers:
             raise ValueError(
-                f"source profile database.tables 역할 누락: {sorted(missing_roles)}"
+                f"지원하지 않는 cohort provider입니다: "
+                f"{self.cohort.provider!r}"
             )
         if self.cohort.key_type not in {"integer", "string"}:
             raise ValueError("cohort.key_type은 integer 또는 string이어야 합니다.")
@@ -142,11 +118,9 @@ class SourceProfile:
                 f"{self.name} profile에 {resource_type} query가 없습니다."
             ) from exc
 
-    def table(self, role: str) -> str:
-        try:
-            return self.tables[role]
-        except KeyError as exc:
-            raise ValueError(
-                f"{self.name} profile에 table 역할 {role!r}가 없습니다."
-            ) from exc
-
+    @property
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256()
+        for path in (self.source_path, self.query_path):
+            digest.update(path.read_bytes())
+        return digest.hexdigest()

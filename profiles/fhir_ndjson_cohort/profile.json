@@ -1,0 +1,17 @@
+{
+  "name": "fhir-ndjson-cohort",
+  "description": "Source-neutral PostgreSQL to FHIR R4 profile with an optional Patient NDJSON cohort",
+  "query_profiles": "../common/clinical_queries.json",
+  "bundle_namespace": "database-to-fhir",
+  "cohort": {
+    "provider": "fhir-patient-ndjson",
+    "patient_file_patterns": [
+      "Patient.ndjson",
+      "Patient.ndjson.gz",
+      "*/Patient.ndjson",
+      "*/Patient.ndjson.gz"
+    ],
+    "identifier_system": null,
+    "key_type": "string"
+  }
+}

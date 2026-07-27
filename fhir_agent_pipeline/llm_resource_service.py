@@ -1,31 +1,98 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .agents import FhirResourceGenerationAgent
 from .config import Settings
 from .fhir_schema import FhirSchemaRepository
 from .json_utils import dump_json
-from .mapping_config import SourceMappingConfig
 from .resource_registry import resource_semantic_errors
+from .source_contract import (
+    encounter_reference,
+    patient_reference,
+    stable_resource_id,
+)
 from .vector_store import PgVectorKnowledgeStore
 
 
 def empty_array_errors(value: Any, path: str = "resource") -> list[str]:
-    """JSON Schema가 놓치는 FHIR 기본 규칙인 빈 반복 요소를 찾습니다."""
-
     errors: list[str] = []
     if isinstance(value, dict):
         for key, nested in value.items():
             errors.extend(empty_array_errors(nested, f"{path}.{key}"))
     elif isinstance(value, list):
         if not value:
-            errors.append(f"{path}는 빈 배열일 수 없습니다. 값이 없으면 속성을 제거하세요.")
+            errors.append(f"{path}는 빈 배열일 수 없습니다. 값이 없으면 제거하세요.")
         else:
             for index, nested in enumerate(value):
                 errors.extend(empty_array_errors(nested, f"{path}[{index}]"))
     return errors
+
+
+def _remove_empty(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, nested in value.items()
+            if (cleaned := _remove_empty(nested)) not in (None, "", [], {})
+        }
+    if isinstance(value, list):
+        return [
+            cleaned
+            for nested in value
+            if (cleaned := _remove_empty(nested)) not in (None, "", [], {})
+        ]
+    return value
+
+
+def _fhir_datetime(value: Any, timezone: str) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).replace(" ", "T")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if "T" not in text:
+        return text
+    if parsed.tzinfo is None:
+        return text + timezone
+    return parsed.isoformat()
+
+
+def _codeable(row: dict[str, Any]) -> dict[str, Any]:
+    coding = {
+        key: value
+        for key, value in {
+            "system": row.get("_code_system"),
+            "code": (
+                str(row["_code"]) if row.get("_code") is not None else None
+            ),
+        }.items()
+        if value not in (None, "")
+    }
+    return {
+        key: value
+        for key, value in {
+            "coding": [coding] if coding else None,
+            "text": row.get("_display"),
+        }.items()
+        if value not in (None, "", [])
+    }
+
+
+def _number(value: Any) -> int | float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    try:
+        parsed = float(str(value))
+    except ValueError:
+        return None
+    return int(parsed) if parsed.is_integer() else parsed
 
 
 @dataclass(frozen=True)
@@ -39,21 +106,19 @@ class FhirGenerationResult:
     initial_error_count: int
 
     def metrics(self) -> dict[str, int | float]:
+        failed_first_pass = self.batches - self.first_pass_valid_batches
         return {
             "batches": self.batches,
             "llm_calls_used": self.llm_calls_used,
             "first_pass_valid_batches": self.first_pass_valid_batches,
             "first_pass_valid_rate": (
-                1.0
-                if not self.batches
+                1.0 if not self.batches
                 else self.first_pass_valid_batches / self.batches
             ),
             "repaired_batches": self.repaired_batches,
             "repair_success_rate": (
-                1.0
-                if not self.batches - self.first_pass_valid_batches
-                else self.repaired_batches
-                / (self.batches - self.first_pass_valid_batches)
+                1.0 if not failed_first_pass
+                else self.repaired_batches / failed_first_pass
             ),
             "repair_attempts": self.repair_attempts,
             "initial_error_count": self.initial_error_count,
@@ -62,19 +127,45 @@ class FhirGenerationResult:
         }
 
 
+class FhirGenerationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_type: str,
+        batch_index: int,
+        llm_calls_used: int,
+        validation_errors: list[str],
+        previous_payload: Any,
+    ) -> None:
+        super().__init__(message)
+        self.resource_type = resource_type
+        self.batch_index = batch_index
+        self.llm_calls_used = llm_calls_used
+        self.validation_errors = validation_errors
+        self.previous_payload = previous_payload
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "resource_type": self.resource_type,
+            "batch_index": self.batch_index,
+            "llm_calls_used": self.llm_calls_used,
+            "validation_errors": self.validation_errors,
+            "previous_payload": self.previous_payload,
+        }
+
+
 class FhirLlmResourceService:
-    """Vector 문맥 조회, LLM FHIR 생성, 소스 충실도와 Schema 검사를 담당합니다."""
+    """정책 mapping 없이 SQL 결과와 FHIR Schema로 리소스를 생성합니다."""
 
     def __init__(
         self,
         settings: Settings,
-        mapping: SourceMappingConfig,
         schema: FhirSchemaRepository,
         agent: FhirResourceGenerationAgent,
         vector_store: PgVectorKnowledgeStore | None,
     ) -> None:
         self.settings = settings
-        self.mapping = mapping
         self.schema = schema
         self.agent = agent
         self.vector_store = vector_store
@@ -83,71 +174,63 @@ class FhirLlmResourceService:
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
-        subject_id: int | str,
+        patient_key: int | str,
     ) -> FhirGenerationResult:
         context = self._fhir_context(resource_type)
         resources: list[dict[str, Any]] = []
-        calls = 0
-        batches = 0
-        first_pass_valid_batches = 0
-        repaired_batches = 0
-        initial_error_count = 0
+        calls = batches = first_pass = repaired = initial_errors = 0
         batch_size = self.settings.llm_fhir_batch_size
         for start in range(0, len(rows), batch_size):
             batches += 1
             batch = rows[start : start + batch_size]
             previous: Any = None
-            validation_errors: list[str] = []
+            errors: list[str] = []
             for attempt in range(1, self.settings.llm_fhir_max_attempts + 1):
                 calls += 1
                 try:
                     previous = self.agent.run(
                         resource_type,
                         batch,
-                        self._identity_contract(resource_type, batch, subject_id),
+                        self._identity_contract(resource_type, batch, patient_key),
                         context,
                         previous,
-                        validation_errors,
+                        errors,
                     )
-                    generated, validation_errors = self._candidate_errors(
-                        resource_type, batch, previous, subject_id
+                    generated, errors = self._candidate_errors(
+                        resource_type, batch, previous, patient_key
                     )
                 except (KeyError, TypeError, ValueError) as exc:
                     generated = []
-                    validation_errors = [f"{type(exc).__name__}: {exc}"]
-                if not validation_errors:
+                    errors = [f"{type(exc).__name__}: {exc}"]
+                if not errors:
                     resources.extend(generated)
                     if attempt == 1:
-                        first_pass_valid_batches += 1
+                        first_pass += 1
                     else:
-                        repaired_batches += 1
+                        repaired += 1
                     break
                 if attempt == 1:
-                    initial_error_count += len(validation_errors)
+                    initial_errors += len(errors)
                 if attempt == self.settings.llm_fhir_max_attempts:
-                    raise RuntimeError(
+                    raise FhirGenerationError(
                         f"{resource_type} LLM 생성이 {attempt}회 후에도 실패했습니다: "
-                        + "; ".join(validation_errors[:10])
+                        + "; ".join(errors[:10]),
+                        resource_type=resource_type,
+                        batch_index=batches - 1,
+                        llm_calls_used=calls,
+                        validation_errors=list(errors),
+                        previous_payload=previous,
                     )
         return FhirGenerationResult(
-            resources=resources,
-            llm_calls_used=calls,
-            batches=batches,
-            first_pass_valid_batches=first_pass_valid_batches,
-            repaired_batches=repaired_batches,
-            repair_attempts=calls - batches,
-            initial_error_count=initial_error_count,
+            resources, calls, batches, first_pass, repaired,
+            calls - batches, initial_errors,
         )
 
     def _fhir_context(self, resource_type: str) -> str:
-        query = (
-            f"FHIR R4 {resource_type} required fields identifiers references source "
-            "source columns timezone ICD terminology UCUM mapping"
-        )
         matches = (
             self.vector_store.search(
                 self.settings.fhir_vector_table,
-                query,
+                f"FHIR R4 {resource_type} required properties references datatypes",
                 k=self.settings.llm_fhir_context_search_k,
             )
             if self.settings.vectors_enabled and self.vector_store
@@ -155,26 +238,20 @@ class FhirLlmResourceService:
         )
         if self.settings.vectors_enabled and not matches:
             raise RuntimeError(
-                f"{self.settings.fhir_vector_table}에서 {resource_type} 문맥을 찾지 못했습니다. "
-                "먼저 build-vectors를 실행하세요."
+                f"{self.settings.fhir_vector_table}에서 {resource_type} 문맥이 없습니다."
             )
         definition = self.schema.definition(resource_type)
-        schema_contract = {
+        contract = {
             "resourceType": resource_type,
-            "required_top_level_properties": definition.get("required", []),
-            "allowed_top_level_properties": list(
-                definition.get("properties", {}).keys()
-            ),
-            "additional_top_level_properties_allowed": False,
+            "required": definition.get("required", []),
+            "allowed": list(definition.get("properties", {})),
         }
         return (
-            "Official local FHIR JSON Schema contract (authoritative):\n"
-            + dump_json(schema_contract)
+            "Official local FHIR R4 JSON Schema:\n" + dump_json(contract)
             + (
-                "\n\nVectorDB retrieval:\n"
+                "\n\nVectorDB FHIR Schema retrieval:\n"
                 + "\n\n".join(item["content"] for item in matches)
-                if matches
-                else "\n\nVectorDB retrieval disabled for RAG ablation baseline."
+                if matches else ""
             )
         )
 
@@ -182,228 +259,48 @@ class FhirLlmResourceService:
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
-        subject_id: int | str,
+        patient_key: int | str,
     ) -> str:
-        patient_id = self.mapping.resource_id(
-            "Patient", {"subject_id": subject_id}
-        )
-        common: dict[str, Any] = {
-            "patient_id": patient_id,
-            "patient_reference": f"Patient/{patient_id}",
-            "default_timezone_for_naive_datetime": self.settings.fhir_default_timezone,
-            "source_row_count": len(rows),
-            "expected_identity_by_source_row": [
-                {
-                    "source_row": index,
-                    "resource_id": self._expected_id(resource_type, row),
-                    "identifier_value": self._expected_id(resource_type, row),
-                }
-                for index, row in enumerate(rows)
+        expected = [
+            {
+                "source_row": index,
+                "resource_id": stable_resource_id(resource_type, row),
+                "patient_reference": patient_reference(patient_key),
+                "encounter_reference": (
+                    encounter_reference(row["_encounter_key"])
+                    if resource_type not in {"Patient", "Encounter"}
+                    else None
+                ),
+            }
+            for index, row in enumerate(rows)
+        ]
+        return dump_json({
+            "rules": [
+                "Return {resources:[{source_row:int,resource:object}]} only.",
+                "Return exactly one FHIR resource per SQL row.",
+                "Use only values present in the SQL row; never invent source values.",
+                "Use a coding system only when the SQL _code_system/_unit_system provides it.",
+                "Omit unavailable optional properties and empty arrays.",
+                "Use FHIR R4 and the exact resource IDs/references below.",
             ],
-        }
-        contract_builders = {
-            "Patient": self._patient_contract,
-            "Encounter": self._encounter_contract,
-            "Condition": self._condition_contract,
-            "Procedure": self._procedure_contract,
-            "Observation": self._observation_contract,
-        }
-        try:
-            builder = contract_builders[resource_type]
-        except KeyError as exc:
-            raise ValueError(f"지원하지 않는 FHIR 리소스입니다: {resource_type}") from exc
-        common.update(
-            builder() if resource_type == "Patient" else builder(subject_id)
-        )
-        return dump_json(common)
-
-    def _patient_contract(self) -> dict[str, Any]:
-        mapping = self.mapping
-        return {
-            "id_rule": mapping.resource_id_rule("Patient"),
-            "identifier_system": mapping.patient_identifier_system,
-            "gender_map": mapping.patient_gender_map,
-            "gender_rule": "Use gender_map exactly; do not invent birthDate",
-            "death_date_rule": (
-                "When source death_date is present, use it as deceasedDateTime; "
-                "otherwise omit deceasedDateTime"
-            ),
-            "required_json_shape": {
-                "resourceType": "Patient",
-                "id": "<configured Patient ID>",
-                "identifier": [
-                    {"system": "<configured system>", "value": "<same id>"}
-                ],
-                "gender": "<male|female|other|unknown when supported>",
-            },
-        }
-
-    def _encounter_contract(self, subject_id: int | str) -> dict[str, Any]:
-        mapping = self.mapping
-        patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
-        return {
-            "id_rule": mapping.resource_id_rule("Encounter"),
-            "identifier_system": mapping.encounter_identifier_system,
-            "class_system": mapping.encounter_class_system,
-            "class_by_admission_type": mapping.encounter_class_by_type,
-            "default_class": mapping.encounter_default_class,
-            "status_when_end_exists": mapping.encounter_status_when_ended,
-            "status_when_end_missing": mapping.encounter_status_when_open,
-            "required_json_shape": {
-                "resourceType": "Encounter",
-                "id": "<configured Encounter ID>",
-                "identifier": [
-                    {"system": "<configured system>", "value": "<same id>"}
-                ],
-                "status": "<configured status>",
-                "class": {"system": "<class system>", "code": "<mapped class>"},
-                "subject": {"reference": f"Patient/{patient_id}"},
-                "period": {
-                    "start": "<admittime with timezone>",
-                    "end": "<dischtime with timezone>",
-                },
-            },
-        }
-
-    def _condition_contract(self, subject_id: int | str) -> dict[str, Any]:
-        mapping = self.mapping
-        patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
-        return {
-            "id_rule": mapping.resource_id_rule("Condition"),
-            "identifier_system": mapping.condition_identifier_system,
-            "icd_systems": mapping.diagnosis_icd_systems,
-            "icd_system_rule": "Use each source row's fhir_icd_system exactly",
-            "icd_decimal_positions": mapping.diagnosis_decimal_positions,
-            "icd_prefix_decimal_positions": mapping.diagnosis_prefix_decimal_positions,
-            "category_system": mapping.fhir_default("condition_category_system"),
-            "category_code": mapping.fhir_default("condition_category_code"),
-            "required_json_shape": {
-                "resourceType": "Condition",
-                "id": "<configured Condition ID>",
-                "identifier": [
-                    {"system": "<configured system>", "value": "<same id>"}
-                ],
-                "category": [
-                    {"coding": [{"system": "<category system>", "code": "<category code>"}]}
-                ],
-                "code": {
-                    "coding": [
-                        {"system": "<ICD system>", "code": "<ICD code>", "display": "<long_title>"}
-                    ]
-                },
-                "subject": {"reference": f"Patient/{patient_id}"},
-                "encounter": {"reference": "Encounter/<configured Encounter ID>"},
-            },
-        }
-
-    def _procedure_contract(self, subject_id: int | str) -> dict[str, Any]:
-        mapping = self.mapping
-        patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
-        return {
-            "id_rule": mapping.resource_id_rule("Procedure"),
-            "identifier_system": mapping.procedure_identifier_system,
-            "status": mapping.fhir_default("procedure_status"),
-            "icd_systems": mapping.procedure_icd_systems,
-            "icd_system_rule": "Use each source row's fhir_icd_system exactly",
-            "icd_decimal_positions": mapping.procedure_decimal_positions,
-            "required_json_shape": {
-                "resourceType": "Procedure",
-                "id": "<configured Procedure ID>",
-                "identifier": [
-                    {"system": "<configured system>", "value": "<same id>"}
-                ],
-                "status": "<configured status>",
-                "code": {
-                    "coding": [
-                        {"system": "<ICD system>", "code": "<ICD code>", "display": "<long_title>"}
-                    ]
-                },
-                "subject": {"reference": f"Patient/{patient_id}"},
-                "encounter": {"reference": "Encounter/<configured Encounter ID>"},
-                "performedDateTime": "<chartdate when present>",
-            },
-        }
-
-    def _observation_contract(self, subject_id: int | str) -> dict[str, Any]:
-        mapping = self.mapping
-        patient_id = mapping.resource_id("Patient", {"subject_id": subject_id})
-        ucum_system = str(mapping.fhir_default("ucum_system"))
-        return {
-            "id_rule": mapping.resource_id_rule("Observation"),
-            "identifier_system": mapping.lab_event_identifier_system,
-            "code_system": mapping.lab_item_system,
-            "status": mapping.fhir_default("observation_status"),
-            "category_system": mapping.fhir_default("observation_category_system"),
-            "category_code": mapping.fhir_default("observation_category_code"),
-            "quantity_system": mapping.fhir_default("ucum_system"),
-            "ucum_code_map": mapping.fhir_default("ucum_code_map"),
-            "required_json_shape": {
-                "resourceType": "Observation",
-                "id": "<configured Observation ID>",
-                "identifier": [
-                    {"system": "<configured system>", "value": "<same id>"}
-                ],
-                "status": "<configured status>",
-                "category": [
-                    {"coding": [{"system": "<category system>", "code": "<category code>"}]}
-                ],
-                "code": {
-                    "coding": [{"system": "<item system>", "code": "<itemid>"}]
-                },
-                "subject": {"reference": f"Patient/{patient_id}"},
-                "encounter": {"reference": "Encounter/<configured Encounter ID>"},
-                "effectiveDateTime": "<charttime with timezone>",
-                "valueQuantity": {
-                    "value": "<valuenum>",
-                    "unit": "<valueuom>",
-                    "system": ucum_system,
-                    "code": "<UCUM code>",
-                },
-                "referenceRange": [
-                    {
-                        "low": {
-                            "value": "<ref_range_lower>",
-                            "unit": "<valueuom>",
-                            "system": ucum_system,
-                            "code": "<UCUM code>",
-                        },
-                        "high": {
-                            "value": "<ref_range_upper>",
-                            "unit": "<valueuom>",
-                            "system": ucum_system,
-                            "code": "<UCUM code>",
-                        },
-                    }
-                ],
-                "interpretation": [{"text": "<flag when present>"}],
-            },
-            "value_rule": (
-                "Use valueQuantity for valuenum, otherwise valueString for value; "
-                "never emit both"
-            ),
-            "reference_range_rule": (
-                "referenceRange MUST be a JSON array when present, never an object"
-            ),
-            "interpretation_rule": "interpretation MUST be a JSON array when present",
-        }
-
-    def _expected_id(self, resource_type: str, row: dict[str, Any]) -> str:
-        return self.mapping.resource_id_from_row(resource_type, row)
+            "default_timezone_for_naive_datetime": self.settings.fhir_default_timezone,
+            "expected": expected,
+        })
 
     def _candidate_errors(
         self,
         resource_type: str,
         rows: list[dict[str, Any]],
         payload: Any,
-        subject_id: int | str,
+        patient_key: int | str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         if not isinstance(payload, dict) or not isinstance(payload.get("resources"), list):
             return [], ["응답에 resources 배열이 없습니다."]
-        errors: list[str] = []
         wrappers = payload["resources"]
+        errors: list[str] = []
         if len(wrappers) != len(rows):
             errors.append(
-                f"리소스 수 {len(wrappers)}가 소스 행 수 {len(rows)}와 다릅니다."
+                f"리소스 수 {len(wrappers)}가 SQL 행 수 {len(rows)}와 다릅니다."
             )
         indexed: dict[int, dict[str, Any]] = {}
         for wrapper in wrappers:
@@ -417,180 +314,137 @@ class FhirLlmResourceService:
             if index in indexed:
                 errors.append(f"source_row={index}가 중복됐습니다.")
             elif not isinstance(resource, dict):
-                errors.append(f"source_row={index}의 resource가 객체가 아닙니다.")
+                errors.append(f"source_row={index} resource가 객체가 아닙니다.")
             else:
                 indexed[index] = resource
-
-        resources: list[dict[str, Any]] = []
+        generated: list[dict[str, Any]] = []
         for index, row in enumerate(rows):
             resource = indexed.get(index)
             if resource is None:
-                errors.append(f"source_row={index} 결과가 없습니다.")
+                errors.append(f"source_row={index}가 없습니다.")
                 continue
-            resources.append(resource)
-            self._validate_identity(resource_type, row, resource, subject_id, index, errors)
-            self._validate_terminology(resource_type, row, resource, index, errors)
+            normalized = self._normalize(resource_type, row, resource, patient_key)
+            generated.append(normalized)
+            if normalized.get("resourceType") != resource_type:
+                errors.append(f"source_row={index} resourceType 오류")
+            if normalized.get("id") != stable_resource_id(resource_type, row):
+                errors.append(f"source_row={index} id 오류")
             errors.extend(
-                f"source_row={index}: {error}"
-                for error in empty_array_errors(resource)
-            )
-            schema_errors = self.schema.errors(resource)
-            semantic_errors = resource_semantic_errors(resource)
-            if schema_errors or semantic_errors:
-                errors.extend(
-                    f"source_row={index}: {error}"
-                    for error in [*schema_errors, *semantic_errors]
+                f"source_row={index} {item}"
+                for item in (
+                    self.schema.errors(normalized)
+                    + resource_semantic_errors(normalized)
+                    + empty_array_errors(normalized)
                 )
-        return resources, errors
+            )
+        return generated, errors
 
-    def _validate_identity(
+    def _normalize(
         self,
         resource_type: str,
         row: dict[str, Any],
         resource: dict[str, Any],
-        subject_id: int | str,
-        index: int,
-        errors: list[str],
-    ) -> None:
-        expected_id = self._expected_id(resource_type, row)
-        if str(resource.get("id")) != expected_id:
-            errors.append(f"source_row={index} id는 {expected_id!r}여야 합니다.")
-        identifier_system = self.mapping.identifier_system_for(resource_type)
-        identifier = (resource.get("identifier") or [{}])[0]
-        if identifier.get("system") != identifier_system:
-            errors.append(
-                f"source_row={index} identifier.system은 "
-                f"{identifier_system!r}여야 합니다."
-            )
-        if str(identifier.get("value")) != expected_id:
-            errors.append(
-                f"source_row={index} identifier.value는 리소스 ID "
-                f"{expected_id!r}와 같아야 합니다."
-            )
-        if resource_type != "Patient":
-            patient_id = self.mapping.resource_id(
-                "Patient", {"subject_id": subject_id}
-            )
-            expected_subject = f"Patient/{patient_id}"
-            if resource.get("subject", {}).get("reference") != expected_subject:
-                errors.append(
-                    f"source_row={index} subject.reference는 {expected_subject!r}여야 합니다."
-                )
-        if resource_type in {"Condition", "Procedure", "Observation"}:
-            columns = self.mapping.columns_for(resource_type)
-            admission_id = row.get(columns.get("admission_id"))
-            if admission_id is not None:
-                encounter_id = self.mapping.resource_id(
-                    "Encounter", {"admission_id": admission_id}
-                )
-                expected_encounter = f"Encounter/{encounter_id}"
-                if resource.get("encounter", {}).get("reference") != expected_encounter:
-                    errors.append(
-                        f"source_row={index} encounter.reference는 "
-                        f"{expected_encounter!r}여야 합니다."
-                    )
-
-    def _validate_terminology(
-        self,
-        resource_type: str,
-        row: dict[str, Any],
-        resource: dict[str, Any],
-        index: int,
-        errors: list[str],
-    ) -> None:
-        if resource_type == "Patient":
-            self._validate_patient(row, resource, index, errors)
-        elif resource_type == "Observation":
-            self._validate_ucum(row, resource, index, errors)
-        elif resource_type in {"Condition", "Procedure"}:
-            self._validate_icd(resource_type, row, resource, index, errors)
-
-    def _validate_patient(
-        self,
-        row: dict[str, Any],
-        resource: dict[str, Any],
-        index: int,
-        errors: list[str],
-    ) -> None:
-        source_gender = row.get(self.mapping.patient_columns.get("gender"))
-        expected_gender = self.mapping.patient_gender_map.get(
-            str(source_gender or "").strip().upper()
-        )
-        if expected_gender and resource.get("gender") != expected_gender:
-            errors.append(
-                f"source_row={index} gender는 매핑된 소스 값 "
-                f"{expected_gender!r}여야 합니다."
-            )
-        if "birthDate" in resource:
-            errors.append(
-                f"source_row={index} birthDate는 조회한 소스 컬럼에 근거가 없어야 합니다."
-            )
-        source_death = row.get(self.mapping.patient_columns.get("death_date"))
-        actual_death = resource.get("deceasedDateTime")
-        if source_death and not (
-            actual_death == source_death
-            or (
-                isinstance(source_death, str)
-                and len(source_death) == 10
-                and isinstance(actual_death, str)
-                and actual_death.startswith(source_death + "T00:00:00")
-            )
+        patient_key: int | str,
+    ) -> dict[str, Any]:
+        normalized = dict(resource)
+        normalized["resourceType"] = resource_type
+        normalized["id"] = stable_resource_id(resource_type, row)
+        normalized.pop("identifier", None)
+        for unsupported in (
+            "meta",
+            "implicitRules",
+            "language",
+            "text",
+            "contained",
+            "extension",
+            "modifierExtension",
         ):
-            errors.append(
-                f"source_row={index} deceasedDateTime은 소스 death_date "
-                f"{source_death!r}와 같아야 합니다."
+            normalized.pop(unsupported, None)
+        if resource_type == "Patient":
+            for key in tuple(normalized):
+                if key.startswith("deceased"):
+                    normalized.pop(key, None)
+            gender = str(row.get("_gender") or "").upper()
+            normalized_gender = {
+                "M": "male", "MALE": "male",
+                "F": "female", "FEMALE": "female",
+                "O": "other", "OTHER": "other",
+                "U": "unknown", "UNKNOWN": "unknown",
+            }.get(gender)
+            if normalized_gender:
+                normalized["gender"] = normalized_gender
+            death = _fhir_datetime(
+                row.get("_death_datetime"), self.settings.fhir_default_timezone
             )
-        if not source_death and actual_death is not None:
-            errors.append(
-                f"source_row={index} deceasedDateTime은 소스 death_date가 없어야 합니다."
+            if death:
+                normalized["deceasedDateTime"] = death
+        if resource_type == "Encounter":
+            normalized["subject"] = {"reference": patient_reference(patient_key)}
+            encounter_type = row.get("_encounter_type")
+            if encounter_type:
+                normalized["type"] = [{"text": str(encounter_type)}]
+            normalized["class"] = {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                "code": "IMP",
+            }
+            end = _fhir_datetime(
+                row.get("_end_datetime"), self.settings.fhir_default_timezone
             )
-
-    def _validate_ucum(
-        self,
-        row: dict[str, Any],
-        resource: dict[str, Any],
-        index: int,
-        errors: list[str],
-    ) -> None:
-        source_unit = row.get(self.mapping.lab_columns.get("unit"))
-        if not source_unit:
-            return
-        expected_ucum = self.mapping.ucum_code(source_unit)
-        quantities = [resource.get("valueQuantity")]
-        for reference_range in resource.get("referenceRange", []):
-            if isinstance(reference_range, dict):
-                quantities.extend(
-                    [reference_range.get("low"), reference_range.get("high")]
+            normalized["status"] = "finished" if end else "in-progress"
+            normalized["period"] = _remove_empty({
+                "start": _fhir_datetime(
+                    row.get("_start_datetime"),
+                    self.settings.fhir_default_timezone,
+                ),
+                "end": end,
+            })
+        elif resource_type not in {"Patient", "Encounter"}:
+            normalized["subject"] = {"reference": patient_reference(patient_key)}
+            normalized["encounter"] = {
+                "reference": encounter_reference(row["_encounter_key"])
+            }
+            normalized["code"] = _codeable(row)
+            if resource_type == "Procedure":
+                for key in tuple(normalized):
+                    if key.startswith("performed"):
+                        normalized.pop(key, None)
+                normalized["status"] = "completed"
+                event_time = _fhir_datetime(
+                    row.get("_event_datetime"),
+                    self.settings.fhir_default_timezone,
                 )
-        for quantity in quantities:
-            if isinstance(quantity, dict) and quantity.get("code") != expected_ucum:
-                errors.append(
-                    f"source_row={index} UCUM code는 {expected_ucum!r}여야 하고 "
-                    f"unit 표시는 {str(source_unit)!r}로 유지해야 합니다."
+                if event_time:
+                    normalized["performedDateTime"] = event_time
+            if resource_type == "Observation":
+                normalized["status"] = "final"
+                for key in tuple(normalized):
+                    if key.startswith(("effective", "value")):
+                        normalized.pop(key, None)
+                event_time = _fhir_datetime(
+                    row.get("_event_datetime"),
+                    self.settings.fhir_default_timezone,
                 )
-
-    def _validate_icd(
-        self,
-        resource_type: str,
-        row: dict[str, Any],
-        resource: dict[str, Any],
-        index: int,
-        errors: list[str],
-    ) -> None:
-        columns = (
-            self.mapping.diagnosis_columns
-            if resource_type == "Condition"
-            else self.mapping.procedure_columns
-        )
-        expected_code = str(row[columns.get("code")])
-        expected_system = str(row["fhir_icd_system"])
-        coding = (resource.get("code", {}).get("coding") or [{}])[0]
-        if coding.get("code") != expected_code:
-            errors.append(
-                f"source_row={index} ICD code는 정규화된 소스 값 "
-                f"{expected_code!r}여야 합니다."
-            )
-        if coding.get("system") != expected_system:
-            errors.append(
-                f"source_row={index} ICD system은 {expected_system!r}여야 합니다."
-            )
+                if event_time:
+                    normalized["effectiveDateTime"] = event_time
+                if row.get("_value_number") is not None:
+                    normalized["valueQuantity"] = _remove_empty({
+                        "value": _number(row["_value_number"]),
+                        "unit": row.get("_unit"),
+                        "system": row.get("_unit_system"),
+                        "code": row.get("_unit_code"),
+                    })
+                elif row.get("_value_text") is not None:
+                    normalized["valueString"] = str(row["_value_text"])
+                reference_range = _remove_empty({
+                    "low": {
+                        "value": _number(row.get("_reference_low")),
+                    },
+                    "high": {
+                        "value": _number(row.get("_reference_high")),
+                    },
+                })
+                if reference_range:
+                    normalized["referenceRange"] = [reference_range]
+                else:
+                    normalized.pop("referenceRange", None)
+        return _remove_empty(normalized)

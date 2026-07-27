@@ -10,7 +10,10 @@ from typing import Any
 
 from .config import Settings
 from .fhir_schema import FhirSchemaRepository, get_fhir_schema
-from .resource_registry import resource_semantic_errors
+from .resource_registry import (
+    required_bundle_resource_types,
+    resource_semantic_errors,
+)
 
 
 @dataclass(frozen=True)
@@ -185,7 +188,10 @@ def validate_bundle_detailed(bundle: dict[str, Any], settings: Settings) -> Vali
         for entry in entries
         if isinstance(entry, dict) and isinstance(entry.get("resource"), dict)
     }
-    for required_type in settings.fhir_output_resources:
+    required_types = required_bundle_resource_types(
+        settings.fhir_output_resources
+    )
+    for required_type in required_types:
         if required_type not in actual_types:
             errors.append(f"Bundle에 필수 resourceType {required_type!r}가 없습니다.")
 
@@ -216,7 +222,7 @@ def validate_bundle_detailed(bundle: dict[str, Any], settings: Settings) -> Vali
 
     reference_errors, reference_score = _reference_metrics(bundle)
     errors.extend(reference_errors)
-    metrics = _quality_metrics(bundle, settings.fhir_output_resources)
+    metrics = _quality_metrics(bundle, required_types)
     metrics.update(
         {
             "schema_valid_resource_ratio": (

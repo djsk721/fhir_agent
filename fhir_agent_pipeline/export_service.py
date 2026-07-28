@@ -339,10 +339,18 @@ class FhirBatchExportService:
                         build_performance_metrics(report, task_evaluation)
                     )
                 _write_json_atomic(validation_path, report)
+                task_passed = (
+                    not isinstance(task_evaluation, dict)
+                    or task_evaluation.get("task_quality_pass") is True
+                )
                 records.append(
                     {
                         "patient_key": patient_key,
-                        "status": "valid" if report["valid"] else "invalid",
+                        "status": (
+                            "valid"
+                            if report["valid"] and task_passed
+                            else "invalid"
+                        ),
                         "resumed": False,
                         "llm_calls_used": result.llm_calls_used,
                         "bundle": str(bundle_path),
@@ -432,10 +440,18 @@ def validate_export_directory(settings: Settings, directory: Path) -> dict[str, 
                     build_performance_metrics(report, prior_task_evaluation)
                 )
             _write_json_atomic(validation_path, report)
+            task_passed = (
+                not isinstance(prior_task_evaluation, dict)
+                or prior_task_evaluation.get("task_quality_pass") is True
+            )
             records.append(
                 {
                     "patient_key": subject_text,
-                    "status": "valid" if report["valid"] else "invalid",
+                    "status": (
+                        "valid"
+                        if report["valid"] and task_passed
+                        else "invalid"
+                    ),
                     "resumed": False,
                     "bundle": str(bundle_path),
                     "validation": str(validation_path),

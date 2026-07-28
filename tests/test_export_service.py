@@ -127,6 +127,53 @@ def test_batch_export_persists_then_validates(monkeypatch, tmp_path: Path) -> No
     assert (tmp_path / "manifest.json").is_file()
 
 
+def test_batch_export_marks_failed_task_quality_as_invalid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    settings = replace(
+        load_settings(require_database=False),
+        fhir_export_directory=tmp_path,
+        fhir_validator_jar=None,
+        fhir_output_resources=["Patient"],
+    )
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{
+            "fullUrl": "urn:resource:patient:p1",
+            "resource": {"resourceType": "Patient", "id": "p1"},
+        }],
+    }
+
+    class FakePipeline:
+        def __init__(self, _settings):
+            pass
+
+        def run(self, _patient_key):
+            return SimpleNamespace(
+                fhir_payload=bundle,
+                verification_errors=[],
+                llm_calls_used=0,
+                task_evaluation={
+                    "task_quality_pass": False,
+                    "empty_source_confirmation": {
+                        "unconfirmed_empty_resources": ["Observation"],
+                    },
+                },
+            )
+
+    monkeypatch.setattr(
+        "fhir_agent_pipeline.export_service.LlmSqlToFhirPipeline", FakePipeline
+    )
+
+    result = FhirBatchExportService(settings).run(
+        ExportRequest(output_directory=tmp_path, patient_keys=(1,))
+    )
+
+    assert result["valid_patients"] == 0
+    assert result["invalid_patients"] == 1
+
+
 def test_resume_regenerates_invalid_result(monkeypatch, tmp_path: Path) -> None:
     settings = replace(
         load_settings(require_database=False),

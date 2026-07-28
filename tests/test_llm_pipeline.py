@@ -81,7 +81,7 @@ def test_resource_row_limit_never_exceeds_sql_safety_limit() -> None:
     assert service._row_limit("Observation", 5) == 200
 
 
-def test_pipeline_rechecks_all_empty_clinical_relationships() -> None:
+def test_pipeline_rechecks_each_empty_clinical_resource_independently() -> None:
     settings = replace(
         load_settings(require_database=False),
         fhir_output_resources=[
@@ -120,18 +120,14 @@ def test_pipeline_rechecks_all_empty_clinical_relationships() -> None:
                     "_start_datetime": None,
                     "_end_datetime": None,
                 }],
-                "Condition": (
-                    [{
-                        "_patient_key": patient_key,
-                        "_encounter_key": "V-1",
-                        "_resource_key": "C-1",
-                        "_code": "DX",
-                        "_code_system": None,
-                        "_display": None,
-                    }]
-                    if semantic_retry
-                    else []
-                ),
+                "Condition": [{
+                    "_patient_key": patient_key,
+                    "_encounter_key": "V-1",
+                    "_resource_key": "C-1",
+                    "_code": "DX",
+                    "_code_system": None,
+                    "_display": None,
+                }],
                 "Procedure": [],
             }[resource_type]
             return QueriedResourceRows(
@@ -146,6 +142,12 @@ def test_pipeline_rechecks_all_empty_clinical_relationships() -> None:
                         encounter_context.source_relations
                     ),
                     semantic_relationship_retry=semantic_retry,
+                    failure_categories=(
+                        ("result_relationship_empty",)
+                        if semantic_retry and not rows
+                        else ()
+                    ),
+                    empty_result_confirmed=semantic_retry and not rows,
                 ),
                 rows,
             )
@@ -212,7 +214,6 @@ def test_pipeline_rechecks_all_empty_clinical_relationships() -> None:
         item for item in query_service.calls if item[2]
     ]
     assert [item[0] for item in semantic_calls] == [
-        "Condition",
         "Procedure",
     ]
     assert all(
@@ -223,12 +224,18 @@ def test_pipeline_rechecks_all_empty_clinical_relationships() -> None:
     assert result.source_row_counts["Procedure"] == 0
     assert (
         result.task_evaluation["sql"]["semantic_relationship_rechecks"]
-        == 2
+        == 1
     )
     assert (
         result.task_evaluation["sql"]["semantic_relationship_recoveries"]
-        == 1
+        == 0
     )
+    assert result.task_evaluation["empty_source_confirmation"] == {
+        "empty_resources": ["Procedure"],
+        "confirmed_empty_resources": ["Procedure"],
+        "unconfirmed_empty_resources": [],
+        "all_empty_results_confirmed": True,
+    }
 
 
 def test_encounter_result_requires_unique_canonical_keys() -> None:

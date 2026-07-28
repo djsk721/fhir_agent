@@ -1,4 +1,5 @@
 from fhir_agent_pipeline.sql_agent import (
+    clinical_row_restricting_relationships,
     SqlSafetyPolicy,
     neutralize_invented_optional_aliases,
     referenced_source_relations,
@@ -47,6 +48,27 @@ def test_detects_source_neutral_encounter_scope_narrowing() -> None:
     ) == ("EXISTS/IN subquery",)
     assert row_restricting_relationships(
         "SELECT visit_key FROM alpha.visit WHERE person_key = 7"
+    ) == ()
+
+
+def test_detects_multiple_row_producing_clinical_relations() -> None:
+    encounter_lineage = ("alpha.visit",)
+    invalid = (
+        "SELECT e.event_key FROM alpha.visit AS v "
+        "JOIN beta.derived_event AS d ON d.visit_key = v.visit_key "
+        "JOIN gamma.raw_event AS e ON e.visit_key = v.visit_key"
+    )
+    valid = (
+        "SELECT e.event_key FROM gamma.raw_event AS e "
+        "JOIN alpha.visit AS v ON v.visit_key = e.visit_key "
+        "LEFT JOIN gamma.event_dictionary AS d ON d.code = e.code"
+    )
+
+    assert clinical_row_restricting_relationships(
+        invalid, encounter_lineage
+    )
+    assert clinical_row_restricting_relationships(
+        valid, encounter_lineage
     ) == ()
 
 

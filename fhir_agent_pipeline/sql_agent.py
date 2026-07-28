@@ -73,6 +73,13 @@ _EXISTENCE_FILTER = re.compile(
     r"\bEXISTS\s*\(|\bIN\s*\(\s*SELECT\b",
     re.IGNORECASE,
 )
+_QUALIFIED_RELATION_CLAUSE = re.compile(
+    r"\b(?P<clause>FROM|(?:(?:LEFT|RIGHT|FULL|INNER|CROSS)\s+"
+    r"(?:OUTER\s+)?)?JOIN)\s+"
+    r'(?P<schema>"?[A-Za-z_][A-Za-z0-9_]*"?)\s*\.\s*'
+    r'(?P<table>"?[A-Za-z_][A-Za-z0-9_]*"?)',
+    re.IGNORECASE,
+)
 
 
 def referenced_source_relations(sql: str) -> tuple[str, ...]:
@@ -101,6 +108,44 @@ def row_restricting_relationships(sql: str) -> tuple[str, ...]:
         reasons.append("INNER/CROSS JOIN")
     if _EXISTENCE_FILTER.search(sql):
         reasons.append("EXISTS/IN subquery")
+    return tuple(reasons)
+
+
+def clinical_row_restricting_relationships(
+    sql: str,
+    encounter_relations: tuple[str, ...],
+) -> tuple[str, ...]:
+    """병원별 이름 없이 후속 임상 SQL의 행 축소 relation 수를 검사합니다."""
+
+    context = {value.lower() for value in encounter_relations}
+    outside: set[str] = set()
+    row_producing: set[str] = set()
+    for match in _QUALIFIED_RELATION_CLAUSE.finditer(sql):
+        schema = match.group("schema").strip('"').lower()
+        table = match.group("table").strip('"').lower()
+        relation = f"{schema}.{table}"
+        if relation in context:
+            continue
+        outside.add(relation)
+        clause = " ".join(match.group("clause").upper().split())
+        if clause == "FROM" or clause in {
+            "JOIN",
+            "INNER JOIN",
+            "CROSS JOIN",
+        }:
+            row_producing.add(relation)
+
+    reasons: list[str] = []
+    if len(row_producing) > 1:
+        reasons.append(
+            "multiple row-producing clinical relations: "
+            + ", ".join(sorted(row_producing))
+        )
+    if len(outside) > 2:
+        reasons.append(
+            "more than one optional supporting relation: "
+            + ", ".join(sorted(outside))
+        )
     return tuple(reasons)
 
 
@@ -667,22 +712,24 @@ schema context; changing only the filter syntax is not a correction.
                             execution_sql, catalog
                         )
                     safe_sql = self.gateway.validate(execution_sql)
-                    sql, rows = self.gateway.execute(execution_sql)
                 except ValueError as exc:
                     category = "safety_policy"
                     failure_categories.append(category)
                     raise exc
-                except SQLAlchemyError as exc:
-                    category = "database_execution"
-                    failure_categories.append(category)
-                    raise exc
                 if execution_validator:
                     try:
-                        execution_validator(sql, rows)
+                        # 관계·범위 구조는 잘못된 SQL을 DB로 보내기 전에 검사합니다.
+                        execution_validator(safe_sql, [])
                     except SqlResultValidationError as exc:
                         category = exc.category
                         failure_categories.append(category)
                         raise
+                try:
+                    sql, rows = self.gateway.execute(execution_sql)
+                except SQLAlchemyError as exc:
+                    category = "database_execution"
+                    failure_categories.append(category)
+                    raise exc
                 if result_validator:
                     try:
                         result_validator(rows)
@@ -802,6 +849,19 @@ schema context; changing only the filter syntax is not a correction.
                         "Prefer one relation that already stores patient key, "
                         "encounter key, and period; return NULL for unavailable "
                         "optional fields. This is a source-neutral coverage rule."
+                    )
+                if (
+                    isinstance(exc, SqlResultValidationError)
+                    and exc.category == "result_clinical_scope_narrowing"
+                ):
+                    previous_error += (
+                        "\nCorrection required: choose exactly one row-producing "
+                        "clinical event relation. Join the supplied Encounter "
+                        "lineage only when needed. At most one additional "
+                        "supporting or dictionary relation may be joined, and it "
+                        "must use LEFT JOIN so missing support rows cannot remove "
+                        "clinical events. Do not combine raw and derived event "
+                        "relations in one query."
                     )
                 if (
                     isinstance(exc, SqlResultValidationError)

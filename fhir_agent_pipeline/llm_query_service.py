@@ -9,6 +9,7 @@ from .resource_registry import adapter_for
 from .source_contract import FHIR_SOURCE_ALIASES
 from .source_profile import SourceProfile
 from .sql_agent import (
+    clinical_row_restricting_relationships,
     NaturalLanguageSqlAgent,
     SqlAttemptTrace,
     SqlResultValidationError,
@@ -37,6 +38,7 @@ class LlmQueryTrace:
     encounter_qualified_resource_keys: int = 0
     requested_row_limit: int = 0
     row_limit_reached: bool = False
+    empty_result_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,14 +209,26 @@ class LlmClinicalQueryService:
         def validate_execution(
             sql: str, _rows: list[dict[str, Any]]
         ) -> None:
-            if resource_type != "Encounter":
+            if resource_type == "Encounter":
+                narrowing = row_restricting_relationships(sql)
+                if narrowing:
+                    raise SqlResultValidationError(
+                        "result_encounter_scope_narrowing",
+                        "Encounter SQL이 일반 방문/입원을 하위 relation 존재 여부로 "
+                        f"축소할 수 있는 구조를 사용했습니다: {', '.join(narrowing)}",
+                    )
                 return
-            narrowing = row_restricting_relationships(sql)
+            if resource_type == "Patient":
+                return
+            narrowing = clinical_row_restricting_relationships(
+                sql, encounter_context.source_relations
+            )
             if narrowing:
                 raise SqlResultValidationError(
-                    "result_encounter_scope_narrowing",
-                    "Encounter SQL이 일반 방문/입원을 하위 relation 존재 여부로 "
-                    f"축소할 수 있는 구조를 사용했습니다: {', '.join(narrowing)}",
+                    "result_clinical_scope_narrowing",
+                    f"{resource_type} SQL이 대표 임상 relation 외의 relation을 "
+                    "행 축소 JOIN으로 결합했습니다: "
+                    + "; ".join(narrowing),
                 )
 
         answer = self.sql_agent.ask(
@@ -249,6 +263,12 @@ class LlmClinicalQueryService:
                 row_limit_reached=(
                     resource_type != "Patient"
                     and len(rows) >= requested_row_limit
+                ),
+                empty_result_confirmed=(
+                    semantic_relationship_retry
+                    and not rows
+                    and "result_relationship_empty"
+                    in answer.failure_categories
                 ),
             ),
             rows,
@@ -296,6 +316,16 @@ class LlmClinicalQueryService:
             if semantic_relationship_retry
             else "No cross-resource semantic retry is requested."
         )
+        clinical_relation_rule = (
+            "Choose exactly one row-producing clinical event relation. "
+            "Do not combine raw, derived, aggregate, or other event relations "
+            "in one query. Join the supplied Encounter lineage only when needed. "
+            "At most one additional supporting or dictionary relation is allowed "
+            "and it must use LEFT JOIN so missing support rows cannot remove "
+            "clinical events."
+            if resource_type not in {"Patient", "Encounter"}
+            else ""
+        )
         values: dict[str, Any] = {
             "source_schemas": ", ".join(sorted(self.sql_agent.gateway.catalog.schemas)),
             "patient_key": self._sql_literal(patient_key),
@@ -309,7 +339,9 @@ class LlmClinicalQueryService:
                 else ""
             ),
             "encounter_context": encounter_context.prompt_text(),
-            "relationship_retry_instruction": retry_instruction,
+            "relationship_retry_instruction": (
+                clinical_relation_rule + "\n" + retry_instruction
+            ),
             "limit": requested_row_limit,
         }
         return self.profile.query_for(resource_type).render(values)

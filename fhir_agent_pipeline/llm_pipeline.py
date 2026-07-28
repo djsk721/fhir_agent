@@ -212,15 +212,13 @@ class LlmSqlToFhirPipeline:
                 if "Encounter" in adapter.dependencies
                 and not adapter.source_required
             ]
-            if (
-                encounter_context.keys
-                and len(relationship_adapters) >= 2
-                and all(
-                    not queried_by_type[adapter.resource_type].rows
+            if encounter_context.keys:
+                empty_relationship_adapters = [
+                    adapter
                     for adapter in relationship_adapters
-                )
-            ):
-                for adapter in relationship_adapters:
+                    if not queried_by_type[adapter.resource_type].rows
+                ]
+                for adapter in empty_relationship_adapters:
                     current_resource_type = adapter.resource_type
                     previous = queried_by_type[adapter.resource_type]
                     retried = self.query_service.query(
@@ -278,6 +276,27 @@ class LlmSqlToFhirPipeline:
         task_evaluation["vectors_enabled"] = self.settings.vectors_enabled
         task_evaluation["generation"] = generation_metrics
         task_evaluation["sql"] = _sql_metrics(traces)
+        empty_resources = [
+            adapter.resource_type
+            for adapter in relationship_adapters
+            if not queried_by_type[adapter.resource_type].rows
+        ]
+        confirmed_empty_resources = [
+            resource_type
+            for resource_type in empty_resources
+            if queried_by_type[resource_type].trace.empty_result_confirmed
+        ]
+        unconfirmed_empty_resources = sorted(
+            set(empty_resources) - set(confirmed_empty_resources)
+        )
+        task_evaluation["empty_source_confirmation"] = {
+            "empty_resources": sorted(empty_resources),
+            "confirmed_empty_resources": sorted(confirmed_empty_resources),
+            "unconfirmed_empty_resources": unconfirmed_empty_resources,
+            "all_empty_results_confirmed": not unconfirmed_empty_resources,
+        }
+        if unconfirmed_empty_resources:
+            task_evaluation["task_quality_pass"] = False
         report_dict = report.as_dict()
         performance = build_performance_metrics(
             report_dict, task_evaluation
@@ -343,6 +362,9 @@ def _sql_metrics(traces: list[LlmQueryTrace]) -> dict[str, int | float]:
         "encounter_identity_rejections": categories.count(
             "result_encounter_identity"
         ),
+        "clinical_scope_narrowing_rejections": categories.count(
+            "result_clinical_scope_narrowing"
+        ),
         "normalized_contract_aliases": sum(
             len(item.normalized_contract_aliases) for item in traces
         ),
@@ -361,6 +383,9 @@ def _sql_metrics(traces: list[LlmQueryTrace]) -> dict[str, int | float]:
         "semantic_relationship_recoveries": sum(
             item.semantic_relationship_retry and item.row_count > 0
             for item in traces
+        ),
+        "confirmed_empty_queries": sum(
+            item.empty_result_confirmed for item in traces
         ),
         "rag_requested_queries": sum(item.rag_requested for item in traces),
         "rag_used_queries": sum(item.rag_used for item in traces),

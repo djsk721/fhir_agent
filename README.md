@@ -298,6 +298,7 @@ NDJSON에서 첫 환자 한 명을 선택하고, 그 환자에 대해서는 `.en
 - 읽기 전용 transaction과 statement timeout 적용
 - 최종 row limit 강제
 - 필수 generic alias, 환자/encounter 범위, key 고유성, code 값 검증
+- Encounter 및 임상 relation 구조를 DB 실행 전에 검사
 
 실패하면 이전 SQL, DB 오류, 해당 relation의 정확한 metadata를 다시 LLM에
 제공합니다. CTE alias와 `alias.column`은 SQL 구조 및 DB metadata로 증명되는
@@ -337,23 +338,26 @@ Encounter는 특정 하위 임상 이벤트나 체류가 존재하는 환자만 
 실제 테이블명과 컬럼명은 코드·환경변수·profile에 저장하지 않습니다. 실행 SQL과
 현재 연결 DB의 catalog에서 매번 계산되며 환자별 trace에 남습니다.
 
-Encounter가 존재하고 Encounter 의존 선택 리소스가 2종 이상이며 그 조회가
-모두 0건이면 Pipeline은 해당 리소스들의 relation을 한 번 더 검색합니다.
-단일 선택 리소스의 정상적인 0건만으로 관계 오류를 추정하지 않기 위한 조건입니다.
-LLM에는 기존 0건 SQL과 Encounter lineage를 제공하고, 임상 relation이
-Encounter 키를 직접 가진다고 가정하지 말고 metadata로 증명되는 join 경로를
-찾도록 요구합니다. 재조회도 0건이면 데이터를 만들지 않고 정상적인 원천 데이터
-부재로 유지합니다.
+Encounter가 존재하는데 Condition, Procedure 또는 Observation 중 하나가
+0건이면 Pipeline은 해당 리소스만 독립적으로 한 번 더 검색합니다. LLM에는 기존
+0건 SQL과 Encounter lineage를 제공하고, 임상 relation이 Encounter 키를 직접
+가진다고 가정하지 말고 metadata로 증명되는 join 경로를 찾도록 요구합니다.
+재조회 과정에서 첫 0건은 self-correction 대상으로 처리하고 두 번째로도
+0건이면 `empty_result_confirmed=true`인 정상 원천 데이터 부재로 확정합니다.
+확인되지 않은 0건은 `unconfirmed_empty_resources`에 남기고
+`task_quality_pass=false`로 처리합니다. FHIR 형식 검증만 통과했더라도 batch
+manifest에서는 해당 환자를 `invalid`로 분류하므로 `export-validate` 명령도
+실패 상태로 종료됩니다.
 
 ```text
 Encounter SQL 실행
   → key + relation lineage 생성
   → 후속 리소스 SQL에 동일 문맥 전달
-  → 전체 선택 임상 조회가 0건인가?
+  → 각 임상 리소스 조회가 0건인가?
       ├─ 아니요: 그대로 진행
-      └─ 예: 관계 기반 RAG 재검색 및 SQL self-correction
+      └─ 예: 해당 리소스만 관계 기반 RAG 재검색
               ├─ 행 발견: 교정 결과 사용
-              └─ 다시 0건: 원천 데이터 부재로 유지
+              └─ 다시 0건: 확인된 원천 데이터 부재로 유지
 ```
 
 trace와 성능 지표에는 다음 항목이 포함됩니다.
@@ -367,11 +371,14 @@ trace와 성능 지표에는 다음 항목이 포함됩니다.
 | `semantic_relationship_recoveries` | 관계 재검색으로 행을 찾은 리소스 수 |
 | `encounter_scope_narrowing_rejections` | 하위 relation으로 범위를 축소해 거부된 SQL 수 |
 | `encounter_identity_rejections` | Encounter 키 누락·중복으로 거부된 SQL 수 |
+| `clinical_scope_narrowing_rejections` | 복수 임상 relation의 행 축소 JOIN을 실행 전에 거부한 수 |
 | `normalized_contract_aliases` | 값 변경 없이 공통 alias의 선행 underscore를 복원한 수 |
 | `encounter_qualified_resource_keys` | 입원 간 중복 source key를 Encounter 범위로 한정한 행 수 |
 | `requested_row_limit` | 해당 SQL에 실제 적용한 리소스 행 상한 |
 | `row_limit_reached` | 결과가 상한에 도달해 추가 원천 행 가능성이 있는지 |
 | `row_limit_reached_queries` | 상한에 도달한 SQL trace 수 |
+| `empty_result_confirmed` | 두 차례 조회로 실제 0건을 확인했는지 |
+| `confirmed_empty_queries` | 확인된 0건 임상 조회 수 |
 
 LLM SQL이 반환하는 공통 alias는
 [`source_contract.py`](./fhir_agent_pipeline/source_contract.py)에 정의되어
@@ -564,6 +571,29 @@ validation, trace가 생성됩니다.
 Procedure 원천 행 0건은 실패가 아니라 해당 환자·조회 범위에 처치 행이 없는
 정상 결과로 처리됐습니다.
 
+### 임상 JOIN 사전 검사 재검증
+
+2026-07-27에 Observation SQL이 raw/derived 임상 relation을 `INNER JOIN`하여
+원천 행을 제거하던 문제를 수정했습니다. 특정 schema나 table을 제외하지 않고,
+Encounter lineage 밖에서 행을 생성하는 임상 relation이 둘 이상이면 DB 실행
+전에 SQL을 거부합니다. 대표 event relation 하나와 선택적 `LEFT JOIN` 보조
+relation 하나만 허용합니다.
+
+동일 demo 환자를 명령 단위 상한으로 다시 검증한 결과:
+
+| 항목 | 결과 |
+| --- | ---: |
+| valid / invalid / pipeline 실패 | 1 / 0 / 0 |
+| Patient / Encounter / Condition / Procedure / Observation | 1 / 5 / 50 / 1 / 50 |
+| Observation SQL 행 / FHIR 리소스 | 50 / 50 |
+| Task quality pass | true |
+| 확인되지 않은 0건 리소스 | 0 |
+| FHIR Validator fatal / error / warning | 0 / 0 / 319 |
+
+실행된 Observation SQL은 대표 event relation과 동적으로 선택된 Encounter
+lineage만 결합했습니다. 실제 relation 이름은 DB metadata와 RAG 실행 결과이며
+코드에 저장된 병원별 매핑이 아닙니다.
+
 ## 결과 디렉터리 관리
 
 `fhir_export*` 결과 디렉터리는 `.gitignore` 대상입니다. 기준선, 사전검증,
@@ -619,7 +649,7 @@ python -m pytest -q
 python -m compileall -q fhir_agent_pipeline main.py
 ```
 
-현재 회귀 테스트는 58건이며 모두 통과합니다. 임의 이름의 source relation에서
+현재 회귀 테스트는 61건이며 모두 통과합니다. 임의 이름의 source relation에서
 lineage가 동적으로 추출되는지, 모든 선택 임상 조회가 0건일 때 관계 재검색이
 수행되고 복구 결과가 최종 FHIR 입력으로 교체되는지, FK로만 연결된 relation도
 동적 schema hint에 포함되는지를 검사합니다. 하위 relation의 내부 조인과 존재
@@ -638,8 +668,10 @@ QueryService를 실제 Pipeline에 주입하므로 화면에 표시되는 행과
 사용되는 행은 동일한 한 번의 실행 결과입니다. 리소스별 출력의
 `encounter_context_relations`와 `semantic_relationship_retry`, 마지막
 요약의 `semantic_relationship_rechecks`와
-`semantic_relationship_recoveries`, `row_limit_reached_queries`로 관계 교정과
-추출 상한 도달 여부를 확인할 수 있습니다.
+`semantic_relationship_recoveries`, `clinical_scope_narrowing_rejections`,
+`confirmed_empty_queries`, `row_limit_reached_queries`로 관계 교정, 0건 확인,
+추출 상한 도달 여부를 확인할 수 있습니다. Pipeline 실행을 시도했다가 실패하면
+후속 Validator 셀은 이전 Bundle로 대체 검증하지 않고 오류를 표시합니다.
 
 DB metadata, 공통 SQL 질문 profile, FHIR JSON Schema, embedding 모델 또는
 차원이 변경되면 Vector DB를 갱신합니다. CLI 설명, 검증 집계 또는 FHIR

@@ -166,6 +166,34 @@ def test_execution_semantics_error_is_self_corrected() -> None:
         "result_encounter_scope_narrowing",
     )
     assert "broadest canonical encounter" in agent.llm.prompts[1]
+    assert agent.gateway.calls == 1
+
+
+def test_clinical_scope_error_is_rejected_before_database_execution() -> None:
+    agent = _agent()
+    validations = 0
+
+    def validate_execution(_sql, _rows):
+        nonlocal validations
+        validations += 1
+        if validations == 1:
+            raise SqlResultValidationError(
+                "result_clinical_scope_narrowing",
+                "multiple row-producing clinical relations",
+            )
+
+    answer = agent.ask(
+        "observation rows for patient 7",
+        execution_validator=validate_execution,
+    )
+
+    assert answer.failure_categories == (
+        "result_clinical_scope_narrowing",
+    )
+    assert "exactly one row-producing clinical event relation" in (
+        agent.llm.prompts[1]
+    )
+    assert agent.gateway.calls == 1
 
 
 def test_missing_exact_alias_error_adds_focused_correction() -> None:

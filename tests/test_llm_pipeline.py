@@ -1,65 +1,71 @@
 from dataclasses import replace
 
+import pytest
+
 from fhir_agent_pipeline.config import load_settings
-from fhir_agent_pipeline.fhir_schema import get_fhir_schema
 from fhir_agent_pipeline.llm_pipeline import LlmSqlToFhirPipeline
 from fhir_agent_pipeline.llm_query_service import (
+    LlmClinicalQueryService,
     LlmQueryTrace,
     QueriedResourceRows,
     strip_database_padding,
 )
-from fhir_agent_pipeline.llm_resource_service import (
-    FhirGenerationResult,
-    FhirLlmResourceService,
-    _fhir_datetime,
-    empty_array_errors,
-)
+from fhir_agent_pipeline.resource_renderer import RenderResult
+from fhir_agent_pipeline.sql_agent import SqlResultValidationError
 
 
-def test_llm_pipeline_uses_generic_sql_aliases() -> None:
+class FakePatientQueryService:
+    def query(self, resource_type, patient_key, encounter_keys, override):
+        return QueriedResourceRows(
+            LlmQueryTrace(
+                resource_type, "q", "SELECT", "ok", 1, 1
+            ),
+            [{
+                "_patient_key": patient_key,
+                "_gender": "F",
+                "_death_datetime": None,
+            }],
+        )
+
+    def encounter_ids(self, rows):
+        return []
+
+    def close(self):
+        pass
+
+
+def test_pipeline_accepts_renderer_dependency() -> None:
     settings = replace(
         load_settings(require_database=False),
         fhir_output_resources=["Patient"],
         fhir_validator_jar=None,
     )
 
-    class FakeQueryService:
-        def query(self, resource_type, patient_key, encounter_keys, override):
-            return QueriedResourceRows(
-                LlmQueryTrace(
-                    resource_type, "q", "SELECT", "ok", 1, 1
-                ),
+    class FakeRenderer:
+        def generate(
+            self, resource_type, rows, patient_key, encounter_keys
+        ):
+            return RenderResult(
                 [{
-                    "_patient_key": patient_key,
-                    "_gender": "F",
-                    "_death_datetime": None,
+                    "resourceType": "Patient",
+                    "id": str(patient_key),
+                    "gender": "female",
                 }],
-            )
-
-        def encounter_ids(self, rows):
-            return []
-
-        def close(self):
-            pass
-
-    class FakeResourceService:
-        def generate(self, resource_type, rows, patient_key):
-            return FhirGenerationResult(
-                [{"resourceType": "Patient", "id": str(patient_key), "gender": "female"}],
-                1, 1, 1, 0, 0, 0,
+                rows_rendered=1,
             )
 
     result = LlmSqlToFhirPipeline(
         settings,
-        query_service=FakeQueryService(),
-        resource_service=FakeResourceService(),
+        query_service=FakePatientQueryService(),
+        renderer=FakeRenderer(),
     ).run(7)
 
     assert result.validation_report and result.validation_report.valid
     assert result.task_evaluation["source_field_accuracy"]["accuracy"] == 1.0
+    assert result.rendering_metrics["Patient"]["llm_calls_used"] == 0
 
 
-def test_resource_service_enforces_stable_id_and_removes_empty_arrays() -> None:
+def test_default_pipeline_uses_deterministic_renderer() -> None:
     settings = replace(
         load_settings(require_database=False),
         fhir_output_resources=["Patient"],
@@ -67,192 +73,70 @@ def test_resource_service_enforces_stable_id_and_removes_empty_arrays() -> None:
         vectors_enabled=False,
     )
 
-    class FakeAgent:
-        def run(self, *args, **kwargs):
-            return {
-                "resources": [{
-                    "source_row": 0,
-                    "resource": {
-                        "resourceType": "Patient",
-                        "id": "wrong",
-                        "gender": "female",
-                        "name": [],
-                        "meta": {
-                            "profile": ["http://example.org/InventedProfile"],
-                        },
-                    },
-                }]
-            }
-
-    service = FhirLlmResourceService(
+    result = LlmSqlToFhirPipeline(
         settings,
-        get_fhir_schema(settings.fhir_schema_path),
-        FakeAgent(),
-        None,
-    )
-    result = service.generate(
-        "Patient",
-        [{"_patient_key": "P-1", "_gender": "F", "_death_datetime": None}],
-        "P-1",
-    )
+        query_service=FakePatientQueryService(),
+    ).run("P-1")
 
-    assert result.resources[0]["id"] == "P-1"
-    assert "name" not in result.resources[0]
-    assert "meta" not in result.resources[0]
-
-
-def test_resource_service_preserves_source_code_without_system() -> None:
-    settings = replace(
-        load_settings(require_database=False),
-        fhir_validator_jar=None,
-        vectors_enabled=False,
-    )
-
-    class FakeAgent:
-        def run(self, *args, **kwargs):
-            return {
-                "resources": [{
-                    "source_row": 0,
-                    "resource": {"resourceType": "Condition"},
-                }]
-            }
-
-    service = FhirLlmResourceService(
-        settings,
-        get_fhir_schema(settings.fhir_schema_path),
-        FakeAgent(),
-        None,
-    )
-    result = service.generate(
-        "Condition",
-        [{
-            "_patient_key": "P-1",
-            "_encounter_key": "V-1",
-            "_resource_key": "C-1",
-            "_code": "CODE-1",
-            "_code_system": None,
-            "_display": None,
-        }],
-        "P-1",
-    )
-
-    assert result.resources[0]["code"]["coding"] == [{"code": "CODE-1"}]
-
-
-def test_observation_reference_range_is_normalized_from_source() -> None:
-    settings = replace(
-        load_settings(require_database=False),
-        fhir_validator_jar=None,
-        vectors_enabled=False,
-    )
-
-    class FakeAgent:
-        def run(self, *args, **kwargs):
-            return {
-                "resources": [{
-                    "source_row": 0,
-                    "resource": {
-                        "resourceType": "Observation",
-                        "referenceRange": {"low": {"value": 1}},
-                        "valueCodeableConcept": {"text": "invented"},
-                    },
-                }]
-            }
-
-    service = FhirLlmResourceService(
-        settings,
-        get_fhir_schema(settings.fhir_schema_path),
-        FakeAgent(),
-        None,
-    )
-    result = service.generate(
-        "Observation",
-        [{
-            "_patient_key": "P-1",
-            "_encounter_key": "V-1",
-            "_resource_key": "O-1",
-            "_code": "CODE-1",
-            "_code_system": None,
-            "_display": None,
-            "_event_datetime": "2026-07-26 12:00:00",
-            "_value_number": "2.5",
-            "_value_text": None,
-            "_unit": None,
-            "_unit_system": None,
-            "_unit_code": None,
-            "_reference_low": "1.0",
-            "_reference_high": "3.0",
-            "_interpretation": None,
-        }],
-        "P-1",
-    )
-
-    assert result.resources[0]["referenceRange"] == [{
-        "low": {"value": 1},
-        "high": {"value": 3},
+    assert result.generated_resources == [{
+        "resourceType": "Patient",
+        "id": "P-1",
+        "gender": "female",
     }]
-    assert "valueCodeableConcept" not in result.resources[0]
-    assert result.resources[0]["valueQuantity"]["value"] == 2.5
+    assert result.rendering_metrics["Patient"] == {
+        "source_rows": 1,
+        "resources_rendered": 1,
+        "count_alignment_rate": 1.0,
+        "llm_calls_used": 0,
+    }
+    assert result.trace_dict()["mode"] == "llm-sql-and-deterministic-fhir"
 
 
-def test_padding_and_empty_array_validation() -> None:
+def test_database_padding_is_removed_from_source_rows() -> None:
     assert strip_database_padding([{"x": " A "}]) == [{"x": "A"}]
-    assert empty_array_errors({"name": []})
 
 
-def test_fhir_datetime_keeps_date_only_and_zones_timestamp() -> None:
-    assert _fhir_datetime("2026-07-26", "Z") == "2026-07-26"
-    assert _fhir_datetime("2026-07-26 12:34:56", "Z") == "2026-07-26T12:34:56Z"
-
-
-def test_normalizer_keeps_only_source_backed_choice_fields() -> None:
-    settings = replace(
-        load_settings(require_database=False),
-        fhir_validator_jar=None,
-        vectors_enabled=False,
-    )
-    service = FhirLlmResourceService(
-        settings,
-        get_fhir_schema(settings.fhir_schema_path),
-        object(),
-        None,
-    )
-    patient = service._normalize(
-        "Patient",
+def test_patient_query_requires_exactly_one_row() -> None:
+    service = object.__new__(LlmClinicalQueryService)
+    rows = [
         {
-            "_patient_key": "P-1",
+            "_patient_key": 7,
             "_gender": "F",
-            "_death_datetime": "2026-07-26 12:34:56",
+            "_death_datetime": None,
         },
         {
-            "resourceType": "Patient",
-            "deceasedBoolean": True,
-            "deceasedDateTime": "2000-01-01T00:00:00Z",
+            "_patient_key": 7,
+            "_gender": "F",
+            "_death_datetime": None,
         },
-        "P-1",
-    )
-    observation = service._normalize(
-        "Observation",
-        {
-            "_resource_key": "O-1",
-            "_patient_key": "P-1",
-            "_encounter_key": "E-1",
-            "_code": "C-1",
-            "_event_datetime": "2026-07-26 12:34:56",
-            "_value_number": 1,
-        },
-        {
-            "resourceType": "Observation",
-            "effectiveInstant": "2000-01-01T00:00:00Z",
-            "effectiveDateTime": "2000-01-01T00:00:00Z",
-            "valueString": "invented",
-        },
-        "P-1",
-    )
+    ]
 
-    assert patient["deceasedDateTime"] == "2026-07-26T12:34:56Z"
-    assert "deceasedBoolean" not in patient
-    assert observation["effectiveDateTime"] == "2026-07-26T12:34:56Z"
-    assert "effectiveInstant" not in observation
-    assert observation["valueQuantity"]["value"] == 1
-    assert "valueString" not in observation
+    with pytest.raises(SqlResultValidationError, match="정확히 한 행"):
+        service._validate_result("Patient", rows, 7, [])
+
+
+def test_query_rejects_empty_required_values_in_any_row() -> None:
+    service = object.__new__(LlmClinicalQueryService)
+    rows = [
+        {
+            "_patient_key": 7,
+            "_encounter_key": 11,
+            "_encounter_type": "inpatient",
+            "_start_datetime": None,
+            "_end_datetime": None,
+        },
+        {
+            "_patient_key": 7,
+            "_encounter_key": None,
+            "_encounter_type": "inpatient",
+            "_start_datetime": None,
+            "_end_datetime": None,
+        },
+    ]
+
+    with pytest.raises(
+        SqlResultValidationError, match="필수 source 값"
+    ) as captured:
+        service._validate_result("Encounter", rows, 7, [])
+
+    assert captured.value.category == "result_required_value"

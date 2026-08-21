@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .resource_registry import adapter_for
-from .source_contract import FHIR_SOURCE_ALIASES
+from .resource_definition import definition_for
 from .source_profile import SourceProfile
 from .sql_agent import (
     NaturalLanguageSqlAgent,
@@ -81,6 +81,7 @@ class LlmClinicalQueryService:
         encounter_keys: list[int | str],
         encounter_override: int | str | None,
     ) -> QueriedResourceRows:
+        definition = definition_for(resource_type)
         question = self._question(
             resource_type, patient_key, encounter_keys, encounter_override
         )
@@ -89,6 +90,9 @@ class LlmClinicalQueryService:
             result_validator=lambda rows: self._validate_result(
                 resource_type, rows, patient_key, encounter_keys
             ),
+            required_aliases=set(definition.required_source_aliases),
+            expected_aliases=definition.source_aliases,
+            encounter_scope=tuple(encounter_keys),
         )
         rows = strip_database_padding(answer.rows)
         return QueriedResourceRows(
@@ -119,7 +123,8 @@ class LlmClinicalQueryService:
         encounter_keys: list[int | str],
         encounter_override: int | str | None,
     ) -> str:
-        if resource_type not in {"Patient", "Encounter"} and not encounter_keys:
+        definition = definition_for(resource_type)
+        if definition.requires_encounter_scope and not encounter_keys:
             raise ValueError(f"{resource_type} 조회 전에 Encounter 행이 필요합니다.")
         values: dict[str, Any] = {
             "source_schemas": ", ".join(sorted(self.sql_agent.gateway.catalog.schemas)),
@@ -133,15 +138,10 @@ class LlmClinicalQueryService:
                 if encounter_override is not None
                 else ""
             ),
-            "limit": {
-                "Encounter": self.settings.max_encounters,
-                "Condition": self.settings.max_conditions_per_encounter
-                * max(1, len(encounter_keys)),
-                "Procedure": self.settings.max_procedures_per_encounter
-                * max(1, len(encounter_keys)),
-                "Observation": self.settings.max_observations_per_encounter
-                * max(1, len(encounter_keys)),
-            }.get(resource_type, 1),
+            "limit": definition.query_limit(
+                self.settings,
+                len(encounter_keys),
+            ),
         }
         return self.profile.query_for(resource_type).render(values)
 
@@ -152,45 +152,89 @@ class LlmClinicalQueryService:
         patient_key: int | str,
         encounter_keys: list[int | str],
     ) -> None:
-        if not rows and adapter_for(resource_type).source_required:
+        definition = definition_for(resource_type)
+        if not rows and definition.source_required:
             raise SqlResultValidationError(
                 "result_empty_required",
                 f"LLM SQL이 필수 {resource_type} 행을 반환하지 않았습니다.",
             )
         if not rows:
             return
-        required = set(FHIR_SOURCE_ALIASES[resource_type])
-        missing = required - set(rows[0])
+        if resource_type == "Patient" and len(rows) != 1:
+            raise SqlResultValidationError(
+                "result_cardinality",
+                "Patient SQL은 정확히 한 행을 반환해야 합니다. "
+                f"rows={len(rows)}",
+            )
+        missing = set(definition.source_aliases) - set(rows[0])
         if missing:
             raise SqlResultValidationError(
                 "result_required_columns",
                 f"{resource_type} SQL 결과 alias 누락: {sorted(missing)}",
             )
+        empty_required = {
+            alias: [
+                index
+                for index, row in enumerate(rows)
+                if row.get(alias) in (None, "")
+            ]
+            for alias in definition.required_source_aliases
+        }
+        empty_required = {
+            alias: indexes
+            for alias, indexes in empty_required.items()
+            if indexes
+        }
+        if empty_required:
+            raise SqlResultValidationError(
+                "result_required_value",
+                f"{resource_type} 필수 source 값이 비어 있습니다: "
+                f"{empty_required}",
+            )
+        if definition.has_resource_identity:
+            self._validate_resource_identity(resource_type, rows)
         allowed_encounters = {str(value) for value in encounter_keys}
-        if resource_type not in {"Patient", "Encounter"}:
-            keys = [str(row.get("_resource_key")) for row in rows]
-            if len(keys) != len(set(keys)) or any(
-                key in {"", "None"} for key in keys
-            ):
-                raise SqlResultValidationError(
-                    "result_resource_identity",
-                    f"{resource_type} _resource_key는 각 행에서 비어 있지 않고 고유해야 합니다.",
-                )
-            if any(row.get("_code") in (None, "") for row in rows):
-                raise SqlResultValidationError(
-                    "result_required_value",
-                    f"{resource_type} _code는 실제 원천 컬럼 값이어야 합니다.",
-                )
         for index, row in enumerate(rows):
             if str(row.get("_patient_key")) != str(patient_key):
                 raise SqlResultValidationError(
                     "result_patient_scope",
                     f"{resource_type}[{index}]가 요청 환자 범위를 벗어났습니다.",
                 )
-            if resource_type not in {"Patient", "Encounter"} and (
+            if definition.requires_encounter_scope and (
                 str(row.get("_encounter_key")) not in allowed_encounters
             ):
                 raise SqlResultValidationError(
                     "result_encounter_scope",
                     f"{resource_type}[{index}]가 선택 Encounter 범위를 벗어났습니다.",
                 )
+
+    @staticmethod
+    def _validate_resource_identity(
+        resource_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        raw_keys = [row.get("_resource_key") for row in rows]
+        keys = [str(value) for value in raw_keys]
+        empty_indexes = [
+            index
+            for index, value in enumerate(raw_keys)
+            if value in (None, "")
+        ]
+        duplicate_counts = {
+            key: count
+            for key, count in Counter(keys).items()
+            if count > 1
+        }
+        if not duplicate_counts and not empty_indexes:
+            return
+        duplicate_sample = dict(
+            list(sorted(duplicate_counts.items()))[:10]
+        )
+        raise SqlResultValidationError(
+            "result_resource_identity",
+            f"{resource_type} _resource_key는 각 행에서 비어 있지 않고 "
+            f"고유해야 합니다. rows={len(rows)}, "
+            f"unique_keys={len(set(keys))}, "
+            f"empty_row_indexes={empty_indexes[:10]}, "
+            f"duplicate_key_counts={duplicate_sample}",
+        )

@@ -72,7 +72,7 @@ def test_build_performance_metrics_exposes_requested_metric_groups() -> None:
         "observation_quality": {},
         "reference_accuracy": {},
         "terminology_accuracy": {},
-        "generation": {},
+        "sql": {},
     }
 
     result = build_performance_metrics(validation, task)
@@ -146,7 +146,7 @@ def test_aggregate_performance_uses_combined_denominators() -> None:
                         "evaluated": 2,
                     }
                 },
-                "generation": {},
+                "sql": {},
             },
         },
         {
@@ -187,7 +187,7 @@ def test_aggregate_performance_uses_combined_denominators() -> None:
                         "evaluated": 2,
                     }
                 },
-                "generation": {},
+                "sql": {},
             },
         },
     ]

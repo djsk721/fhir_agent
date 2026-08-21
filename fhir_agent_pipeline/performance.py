@@ -3,34 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 
-def _combine_generation_metrics(
-    generation: dict[str, dict[str, Any]],
+def _sql_correction_metrics(
+    sql_metrics: dict[str, Any],
 ) -> dict[str, int | float]:
-    batches = sum(int(item.get("batches", 0)) for item in generation.values())
-    first_pass = sum(
-        int(item.get("first_pass_valid_batches", 0))
-        for item in generation.values()
-    )
-    repaired = sum(
-        int(item.get("repaired_batches", 0))
-        for item in generation.values()
-    )
-    repair_attempts = sum(
-        int(item.get("repair_attempts", 0))
-        for item in generation.values()
-    )
-    initially_invalid = batches - first_pass
+    queries = int(sql_metrics.get("queries", 0))
+    first_pass = int(sql_metrics.get("first_pass_successes", 0))
+    repair_attempts = int(sql_metrics.get("repair_attempts", 0))
     return {
-        "batches": batches,
-        "first_pass_validity_rate": (
-            1.0 if not batches else first_pass / batches
-        ),
-        "repair_success_rate": (
-            1.0 if not initially_invalid else repaired / initially_invalid
+        "target": "sql_query_plan",
+        "queries": queries,
+        "first_pass_successes": first_pass,
+        "first_pass_success_rate": (
+            1.0 if not queries else first_pass / queries
         ),
         "repair_attempts": repair_attempts,
         "average_repair_attempts": (
-            0.0 if not batches else repair_attempts / batches
+            0.0 if not queries else repair_attempts / queries
         ),
     }
 
@@ -46,7 +34,7 @@ def build_performance_metrics(
     observation = task_evaluation.get("observation_quality", {})
     terminology = task_evaluation.get("terminology_accuracy", {})
     references = task_evaluation.get("reference_accuracy", {})
-    generation = task_evaluation.get("generation", {})
+    sql_metrics = task_evaluation.get("sql", {})
     external_errors = sum(
         int(validation.get("validator_issue_counts", {}).get(name, 0))
         for name in ("fatal", "error")
@@ -116,7 +104,7 @@ def build_performance_metrics(
             "source_text_accuracy": terminology.get("source_text", {}),
             "details": terminology,
         },
-        "self_correction": _combine_generation_metrics(generation),
+        "self_correction": _sql_correction_metrics(sql_metrics),
         "rag_effect": {
             "rag_enabled": bool(task_evaluation.get("vectors_enabled")),
             "evaluated": False,
@@ -241,12 +229,19 @@ def aggregate_performance_metrics(
         for value in reference_rates
         if isinstance(value, (int, float))
     ]
-    generation = {
-        f"{patient_index}:{resource_type}": metrics
-        for patient_index, evaluation in enumerate(evaluations)
-        for resource_type, metrics in evaluation.get(
-            "generation", {}
-        ).items()
+    sql_metrics = {
+        "queries": sum(
+            int(item.get("sql", {}).get("queries", 0))
+            for item in evaluations
+        ),
+        "first_pass_successes": sum(
+            int(item.get("sql", {}).get("first_pass_successes", 0))
+            for item in evaluations
+        ),
+        "repair_attempts": sum(
+            int(item.get("sql", {}).get("repair_attempts", 0))
+            for item in evaluations
+        ),
     }
     vector_modes = {
         bool(item.get("vectors_enabled")) for item in evaluations
@@ -356,7 +351,7 @@ def aggregate_performance_metrics(
                 "source_text",
             ),
         },
-        "self_correction": _combine_generation_metrics(generation),
+        "self_correction": _sql_correction_metrics(sql_metrics),
         "rag_effect": {
             "rag_enabled": (
                 next(iter(vector_modes)) if len(vector_modes) == 1 else None
@@ -446,10 +441,6 @@ def compare_rag_performance(
             "coding_quality",
             "coding_accuracy",
             "accuracy",
-        ),
-        "repair_success_rate": (
-            "self_correction",
-            "repair_success_rate",
         ),
     }
 

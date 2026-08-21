@@ -4,8 +4,18 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from fhir_agent_pipeline.config import load_settings
+from fhir_agent_pipeline.db import (
+    SourceColumn,
+    SourceSchemaCatalog,
+    SourceTable,
+)
 from fhir_agent_pipeline.sql_agent import (
     NaturalLanguageSqlAgent,
+    normalize_output_aliases,
+    normalize_resource_key_separators,
+    repair_encounter_identity,
+    repair_invented_projection_literals,
+    repair_scoped_encounter_key,
     SqlGenerationError,
     SqlResultValidationError,
     SqlSchemaContext,
@@ -136,3 +146,281 @@ def test_safety_policy_error_is_self_corrected() -> None:
 
     assert answer.llm_calls_used == 2
     assert answer.failure_categories == ("safety_policy",)
+
+
+def test_identity_correction_precedes_long_schema_hint() -> None:
+    agent = _agent()
+    agent.gateway.schema_hint = lambda _sql: "x" * 10_000
+    validations = 0
+
+    def validate(_rows):
+        nonlocal validations
+        validations += 1
+        if validations == 1:
+            raise SqlResultValidationError(
+                "result_resource_identity",
+                "rows=17, unique_keys=13, duplicate_key_counts={'k': 2}",
+            )
+
+    answer = agent.ask("procedure rows", result_validator=validate)
+
+    assert answer.llm_calls_used == 2
+    correction_prompt = agent.llm.prompts[1]
+    assert "duplicate_key_counts={'k': 2}" in correction_prompt
+    assert "documented primary-key columns" in correction_prompt
+    assert "sequence, order, timestamp, or code columns" in correction_prompt
+    assert correction_prompt.index("duplicate_key_counts") < correction_prompt.index(
+        "Exact columns"
+    )
+
+
+def test_repeated_identity_sql_gets_catalog_driven_fallback() -> None:
+    agent = object.__new__(NaturalLanguageSqlAgent)
+    agent.settings = load_settings(require_database=False)
+
+    class Gateway:
+        catalog = SourceSchemaCatalog((
+            SourceTable(
+                "clinical",
+                "event",
+                (
+                    SourceColumn("sequence", "INTEGER", False),
+                    SourceColumn("code", "TEXT", False),
+                ),
+                (),
+            ),
+        ))
+
+        def validate(self, sql):
+            return f"SAFE({sql})"
+
+        def execute(self, sql):
+            if "md5(to_jsonb(e)::text)" in sql:
+                return f"SAFE({sql})", [
+                    {"_resource_key": "a"},
+                    {"_resource_key": "b"},
+                ]
+            return f"SAFE({sql})", [
+                {"_resource_key": "same"},
+                {"_resource_key": "same"},
+            ]
+
+        def schema_hint(self, _sql):
+            return "clinical.event: sequence, code"
+
+    class Llm:
+        def chat(self, _system, _prompt):
+            return json.dumps({
+                "sql": (
+                    "SELECT e.code AS _resource_key, e.code AS _code "
+                    "FROM clinical.event AS e"
+                ),
+                "explanation": "test",
+            })
+
+    validations = 0
+
+    def validate(rows):
+        nonlocal validations
+        validations += 1
+        keys = [row["_resource_key"] for row in rows]
+        if len(keys) != len(set(keys)):
+            raise SqlResultValidationError(
+                "result_resource_identity", "duplicate key"
+            )
+
+    agent.gateway = Gateway()
+    agent.llm = Llm()
+    agent._schema_context = lambda _question: SqlSchemaContext(
+        content="clinical.event: sequence, code",
+        rag_requested=True,
+        rag_used=True,
+        retrieved_document_count=1,
+        fallback_reason=None,
+    )
+
+    answer = agent.ask("event rows", result_validator=validate)
+
+    assert answer.llm_calls_used == 2
+    assert validations == 2
+    assert "md5(to_jsonb(e)::text)" in answer.sql
+
+
+def test_invented_projection_literal_uses_unique_catalog_column() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "encounters",
+            (
+                SourceColumn("patient_id", "INTEGER", False),
+                SourceColumn("encounter_id", "INTEGER", True),
+                SourceColumn("admission_type", "TEXT", False),
+            ),
+            (),
+        ),
+    ))
+    sql = (
+        "SELECT e.patient_id AS _patient_key, "
+        "CASE WHEN e.encounter_id IS NOT NULL "
+        "THEN 'Admission' ELSE NULL END AS _encounter_type "
+        "FROM clinical.encounters AS e"
+    )
+
+    repaired = repair_invented_projection_literals(sql, catalog)
+
+    assert "e.admission_type AS _encounter_type" in repaired
+    assert "'Admission'" not in repaired
+
+
+def test_invented_projection_repair_removes_empty_concat() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "encounters",
+            (SourceColumn("encounter_id", "INTEGER", True),),
+            (),
+        ),
+    ))
+
+    repaired = repair_invented_projection_literals(
+        "SELECT e.encounter_id::text || '' AS _encounter_key "
+        "FROM clinical.encounters AS e",
+        catalog,
+    )
+
+    assert "|| ''" not in repaired
+
+
+def test_descriptive_aliases_follow_source_contract_order() -> None:
+    sql = (
+        'SELECT p.id AS "patient key", p.sex AS "administrative gender", '
+        'p.death_at AS "death date/time" FROM clinical.patient AS p'
+    )
+
+    repaired = normalize_output_aliases(
+        sql,
+        ("_patient_key", "_gender", "_death_datetime"),
+    )
+
+    assert "p.id AS _patient_key" in repaired
+    assert "p.sex AS _gender" in repaired
+    assert "p.death_at AS _death_datetime" in repaired
+    assert '"patient key"' not in repaired
+
+
+def test_existing_contract_aliases_are_not_reordered() -> None:
+    sql = (
+        "SELECT p.id AS _patient_key, p.sex AS _gender, "
+        "NULL AS _death_datetime FROM clinical.patient AS p"
+    )
+
+    assert normalize_output_aliases(
+        sql,
+        ("_patient_key", "_gender", "_death_datetime"),
+    ) == sql
+
+
+def test_repeated_resource_key_separator_is_normalized() -> None:
+    sql = (
+        "SELECT e.patient_id AS _patient_key, "
+        "e.visit_id::text || '||' || e.code AS _resource_key "
+        "FROM clinical.event AS e"
+    )
+
+    repaired = normalize_resource_key_separators(sql)
+
+    assert "'||'" not in repaired
+    assert "'|'" in repaired
+
+
+def test_encounter_identity_uses_only_metadata_proven_unused_column() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "visits",
+            (
+                SourceColumn("person_id", "INTEGER", False),
+                SourceColumn("visit_id", "INTEGER", False),
+                SourceColumn("visit_type", "TEXT", False),
+                SourceColumn("started_at", "TIMESTAMP", False),
+                SourceColumn("ended_at", "TIMESTAMP", False),
+            ),
+            (),
+        ),
+    ))
+    sql = (
+        "SELECT v.person_id AS _patient_key, "
+        "CAST(v.visit_id AS TEXT) || CAST(NULL AS TEXT) "
+        "AS _encounter_key, "
+        "v.visit_type AS _encounter_type, "
+        "v.started_at AS _start_datetime, "
+        "v.ended_at AS _end_datetime "
+        "FROM clinical.visits AS v"
+    )
+
+    repaired = repair_encounter_identity(sql, catalog)
+
+    assert (
+        'CAST(v."visit_id" AS TEXT) AS _encounter_key'
+        in repaired
+    )
+    assert "CAST(NULL AS TEXT)" not in repaired
+
+
+def test_true_composite_encounter_identity_is_not_guessed() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "visits",
+            (
+                SourceColumn("person_id", "INTEGER", False),
+                SourceColumn("facility_id", "INTEGER", False),
+                SourceColumn("visit_number", "INTEGER", False),
+                SourceColumn("visit_type", "TEXT", False),
+            ),
+            (),
+        ),
+    ))
+    sql = (
+        "SELECT v.person_id AS _patient_key, "
+        "v.facility_id::text || '-' || v.visit_number::text "
+        "AS _encounter_key, "
+        "v.visit_type AS _encounter_type "
+        "FROM clinical.visits AS v"
+    )
+
+    assert repair_encounter_identity(sql, catalog) == sql
+
+
+def test_encounter_key_uses_scope_predicate_column() -> None:
+    sql = (
+        "SELECT e.patient_id AS _patient_key, "
+        "CAST(e.visit_id AS TEXT) || CAST(e.sequence AS TEXT) "
+        "AS _encounter_key, e.code AS _resource_key "
+        "FROM clinical.event AS e "
+        "WHERE CAST(e.visit_id AS TEXT) IN ('11', '12')"
+    )
+
+    repaired = repair_scoped_encounter_key(sql, (11, 12))
+
+    assert (
+        "CAST(e.visit_id AS TEXT) AS _encounter_key"
+        in repaired
+    )
+    assert "CAST(e.sequence AS TEXT) AS _encounter_key" not in repaired
+
+
+def test_encounter_scope_repair_ignores_unrelated_in_predicate() -> None:
+    sql = (
+        "SELECT e.patient_id AS _patient_key, "
+        "e.sequence::text AS _encounter_key, "
+        "e.code AS _resource_key "
+        "FROM clinical.event AS e "
+        "WHERE e.status IN ('final', 'amended') "
+        "AND e.visit_id IN (11, 12)"
+    )
+
+    repaired = repair_scoped_encounter_key(sql, (11, 12))
+
+    assert "CAST(e.visit_id AS TEXT) AS _encounter_key" in repaired
+    assert "CAST(e.status AS TEXT) AS _encounter_key" not in repaired

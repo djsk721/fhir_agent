@@ -3,23 +3,21 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
-from .agents import FhirResourceGenerationAgent
 from .config import Settings
 from .fhir_models import build_bundle
 from .evaluation import evaluate_task_output
 from .fhir_schema import get_fhir_schema
 from .llm_query_service import LlmClinicalQueryService, LlmQueryTrace
-from .llm_resource_service import FhirGenerationError, FhirLlmResourceService
 from .performance import build_performance_metrics
 from .resource_registry import selected_adapters
+from .resource_renderer import DeterministicResourceRenderer
 from .source_profile import SourceProfile
 from .sql_agent import SqlGenerationError
 from .validation import ValidationReport, validate_bundle_detailed
-from .vector_store import PgVectorKnowledgeStore
 
 
 @dataclass(frozen=True)
-class LlmFhirPipelineResult:
+class SqlToFhirPipelineResult:
     fhir_payload: dict[str, Any]
     generated_resources: list[dict[str, Any]]
     verification_errors: list[str]
@@ -27,18 +25,16 @@ class LlmFhirPipelineResult:
     query_traces: list[LlmQueryTrace]
     source_row_counts: dict[str, int]
     llm_calls_used: int
-    generation_llm_calls: dict[str, int]
-    generation_metrics: dict[str, dict[str, int | float]]
+    rendering_metrics: dict[str, dict[str, int | float]]
     task_evaluation: dict[str, Any]
 
     def trace_dict(self) -> dict[str, Any]:
         sql_metrics = _sql_metrics(self.query_traces)
         return {
-            "mode": "llm-sql-and-llm-fhir",
+            "mode": "llm-sql-and-deterministic-fhir",
             "llm_calls_used": self.llm_calls_used,
             "source_row_counts": self.source_row_counts,
-            "generation_llm_calls": self.generation_llm_calls,
-            "generation_metrics": self.generation_metrics,
+            "rendering_metrics": self.rendering_metrics,
             "task_evaluation": self.task_evaluation,
             "performance_evaluation": (
                 self.validation_report.metrics.get(
@@ -66,14 +62,14 @@ class PipelineExecutionError(RuntimeError):
         cause: Exception,
         query_traces: list[LlmQueryTrace],
         source_row_counts: dict[str, int],
-        generation_metrics: dict[str, dict[str, int | float]],
+        rendering_metrics: dict[str, dict[str, int | float]],
     ) -> None:
         super().__init__(message)
         self.resource_type = resource_type
         self.cause = cause
         self.query_traces = list(query_traces)
         self.source_row_counts = dict(source_row_counts)
-        self.generation_metrics = dict(generation_metrics)
+        self.rendering_metrics = dict(rendering_metrics)
 
     def trace_dict(self) -> dict[str, Any]:
         failure: dict[str, Any] = {
@@ -85,27 +81,25 @@ class PipelineExecutionError(RuntimeError):
             failure["sql_attempts"] = [
                 asdict(item) for item in self.cause.attempts
             ]
-        if isinstance(self.cause, FhirGenerationError):
-            failure["fhir_generation"] = self.cause.as_dict()
         return {
-            "mode": "llm-sql-and-llm-fhir",
+            "mode": "llm-sql-and-deterministic-fhir",
             "status": "failed",
             "failure": failure,
             "source_row_counts": self.source_row_counts,
-            "generation_metrics": self.generation_metrics,
+            "rendering_metrics": self.rendering_metrics,
             "sql_generation_metrics": _sql_metrics(self.query_traces),
             "queries": [asdict(item) for item in self.query_traces],
         }
 
 
 class LlmSqlToFhirPipeline:
-    """LLM SQL 조회와 LLM FHIR 생성 서비스를 순서대로 조정합니다."""
+    """LLM SQL 조회와 결정적 FHIR Renderer를 순서대로 조정합니다."""
 
     def __init__(
         self,
         settings: Settings,
         query_service: LlmClinicalQueryService | None = None,
-        resource_service: FhirLlmResourceService | None = None,
+        renderer: DeterministicResourceRenderer | None = None,
     ) -> None:
         self.settings = settings
         self.profile = SourceProfile.load(settings.source_profile_path)
@@ -113,59 +107,22 @@ class LlmSqlToFhirPipeline:
         self.query_service = query_service or LlmClinicalQueryService(
             settings, profile=self.profile
         )
-        if resource_service is None:
-            vector_store = None
-            if settings.vectors_enabled:
-                vector_store = PgVectorKnowledgeStore(
-                    settings, self.query_service.engine
-                )
-                self._require_vector_tables(vector_store)
-            self.resource_service = FhirLlmResourceService(
-                settings,
-                schema,
-                FhirResourceGenerationAgent(settings),
-                vector_store,
+        if renderer is None:
+            self.renderer = DeterministicResourceRenderer(
+                settings, schema
             )
         else:
-            self.resource_service = resource_service
-
-    def _require_vector_tables(self, store: PgVectorKnowledgeStore) -> None:
-        for table_name in (
-            self.settings.sql_vector_table,
-            self.settings.fhir_vector_table,
-        ):
-            report = store.inspect_table(table_name)
-            if (
-                not report.get("exists")
-                or not report.get("compatible")
-                or int(report.get("rows", 0)) < 1
-                or (
-                    table_name == self.settings.sql_vector_table
-                    and int(report.get("current_profile_rows", 0)) < 1
-                )
-                or (
-                    table_name == self.settings.fhir_vector_table
-                    and int(report.get("global_rows", 0)) < 1
-                )
-            ):
-                raise RuntimeError(
-                    f"LLM 변환에 필요한 VectorDB가 준비되지 않았습니다: "
-                    f"{report.get('table', table_name)} "
-                    f"(profile={self.profile.name}, "
-                    f"fingerprint={self.profile.fingerprint[:12]}). "
-                    "build-vectors를 실행하세요."
-                )
+            self.renderer = renderer
 
     def run(
         self,
         patient_key: int | str,
         encounter_key: int | str | None = None,
-    ) -> LlmFhirPipelineResult:
+    ) -> SqlToFhirPipelineResult:
         generated: list[dict[str, Any]] = []
         traces: list[LlmQueryTrace] = []
         source_counts: dict[str, int] = {}
-        generation_calls: dict[str, int] = {}
-        generation_metrics: dict[str, dict[str, int | float]] = {}
+        rendering_metrics: dict[str, dict[str, int | float]] = {}
         source_rows: dict[str, list[dict[str, Any]]] = {}
         generated_by_type: dict[str, list[dict[str, Any]]] = {}
         encounter_keys: list[int | str] = []
@@ -188,20 +145,19 @@ class LlmSqlToFhirPipeline:
                 if adapter.resource_type == "Encounter":
                     encounter_keys = self.query_service.encounter_ids(queried.rows)
 
-                generation_result = self.resource_service.generate(
-                    adapter.resource_type, queried.rows, patient_key
+                render_result = self.renderer.generate(
+                    adapter.resource_type,
+                    queried.rows,
+                    patient_key,
+                    encounter_keys,
                 )
-                generation_calls[adapter.resource_type] = (
-                    generation_result.llm_calls_used
+                rendering_metrics[adapter.resource_type] = (
+                    render_result.metrics()
                 )
-                generation_metrics[adapter.resource_type] = (
-                    generation_result.metrics()
-                )
-                total_calls += generation_result.llm_calls_used
                 generated_by_type[adapter.resource_type] = (
-                    generation_result.resources
+                    render_result.resources
                 )
-                generated.extend(generation_result.resources)
+                generated.extend(render_result.resources)
         except Exception as exc:
             raise PipelineExecutionError(
                 f"{current_resource_type or 'Pipeline'} 처리 실패: {exc}",
@@ -209,7 +165,7 @@ class LlmSqlToFhirPipeline:
                 cause=exc,
                 query_traces=traces,
                 source_row_counts=source_counts,
-                generation_metrics=generation_metrics,
+                rendering_metrics=rendering_metrics,
             ) from exc
         finally:
             self.query_service.close()
@@ -224,7 +180,7 @@ class LlmSqlToFhirPipeline:
             self.settings.fhir_default_timezone,
         )
         task_evaluation["vectors_enabled"] = self.settings.vectors_enabled
-        task_evaluation["generation"] = generation_metrics
+        task_evaluation["rendering"] = rendering_metrics
         task_evaluation["sql"] = _sql_metrics(traces)
         report_dict = report.as_dict()
         performance = build_performance_metrics(
@@ -238,7 +194,7 @@ class LlmSqlToFhirPipeline:
                 "performance_evaluation": performance,
             },
         )
-        return LlmFhirPipelineResult(
+        return SqlToFhirPipelineResult(
             fhir_payload=bundle,
             generated_resources=generated,
             verification_errors=list(report.errors),
@@ -246,8 +202,7 @@ class LlmSqlToFhirPipeline:
             query_traces=traces,
             source_row_counts=source_counts,
             llm_calls_used=total_calls,
-            generation_llm_calls=generation_calls,
-            generation_metrics=generation_metrics,
+            rendering_metrics=rendering_metrics,
             task_evaluation=task_evaluation,
         )
 

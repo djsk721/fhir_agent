@@ -7,6 +7,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+_SQL_RESPONSE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "sql": {"type": "string"},
+    },
+    "required": ["sql"],
+    "additionalProperties": False,
+}
+
+
 class OllamaClient:
     """추가 프레임워크 없이 Ollama의 chat/embed API를 호출합니다."""
 
@@ -62,7 +72,7 @@ class OllamaClient:
             "model": self.chat_model,
             "stream": False,
             "think": False,
-            "format": "json",
+            "format": _SQL_RESPONSE_FORMAT,
             "options": {
                 "temperature": 0,
                 "num_ctx": self.context_size,

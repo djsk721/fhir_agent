@@ -11,6 +11,7 @@ from .config import Settings
 from .db import build_engine, SourceSchemaCatalog
 from .ollama import OllamaClient
 from .json_utils import load_llm_json, normalize_database_value
+from .resource_definition import RESOURCE_DEFINITIONS
 from .vector_store import PgVectorKnowledgeStore, database_schema_documents
 
 
@@ -38,23 +39,15 @@ _TABLE = re.compile(
     r'(?:\s*\.\s*("?[A-Za-z_][A-Za-z0-9_]*"?))?',
     re.IGNORECASE,
 )
-_OPTIONAL_SOURCE_ALIASES = {
-    "_gender",
-    "_death_datetime",
-    "_encounter_type",
-    "_start_datetime",
-    "_end_datetime",
-    "_code_system",
-    "_display",
-    "_event_datetime",
-    "_value_number",
-    "_value_text",
-    "_unit",
-    "_unit_system",
-    "_unit_code",
-    "_reference_low",
-    "_reference_high",
-    "_interpretation",
+_SOURCE_ALIASES = {
+    alias
+    for definition in RESOURCE_DEFINITIONS.values()
+    for alias in definition.source_aliases
+}
+_REQUIRED_SOURCE_ALIASES = {
+    alias
+    for definition in RESOURCE_DEFINITIONS.values()
+    for alias in definition.required_source_aliases
 }
 _RELATION_ALIAS = re.compile(
     r'\b(?:FROM|JOIN)\s+("?[\w]+"?)\s*\.\s*("?[\w]+"?)'
@@ -67,7 +60,206 @@ _NAMED_ALIAS = re.compile(
 )
 
 
-def neutralize_invented_optional_aliases(sql: str) -> str:
+def _split_projection(projection: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    in_string = False
+    index = 0
+    while index < len(projection):
+        char = projection[index]
+        if char == "'":
+            if (
+                in_string
+                and index + 1 < len(projection)
+                and projection[index + 1] == "'"
+            ):
+                index += 2
+                continue
+            in_string = not in_string
+        elif not in_string:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                parts.append(projection[start:index])
+                start = index + 1
+        index += 1
+    parts.append(projection[start:])
+    return parts
+
+
+def normalize_output_aliases(
+    sql: str,
+    expected_aliases: tuple[str, ...] | None,
+) -> str:
+    """요청 순서대로 반환된 설명형 alias를 source-row 계약 alias로 정규화합니다."""
+
+    if not expected_aliases:
+        return sql
+    select_matches = list(re.finditer(r"\bSELECT\b", sql, re.IGNORECASE))
+    if not select_matches:
+        return sql
+    start = select_matches[-1].end()
+    from_match = re.search(r"\bFROM\b", sql[start:], re.IGNORECASE)
+    if not from_match:
+        return sql
+    end = start + from_match.start()
+    parts = _split_projection(sql[start:end])
+    if len(parts) != len(expected_aliases):
+        return sql
+
+    alias_pattern = re.compile(
+        r"\bAS\s+(?P<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)\s*$",
+        re.IGNORECASE,
+    )
+    matches = [alias_pattern.search(part) for part in parts]
+    if any(match is None for match in matches):
+        return sql
+    current_aliases = {
+        match.group("alias").strip('"').lower()
+        for match in matches
+        if match is not None
+    }
+    expected = {alias.lower() for alias in expected_aliases}
+    if current_aliases == expected or current_aliases & expected:
+        return sql
+
+    normalized = [
+        alias_pattern.sub(f"AS {expected_alias}", part)
+        for part, expected_alias in zip(parts, expected_aliases)
+    ]
+    return sql[:start] + ",".join(normalized).rstrip() + "\n" + sql[end:]
+
+
+def normalize_resource_key_separators(sql: str) -> str:
+    """복합 resource key의 반복 구분자를 허용된 단일 구분자로 축약합니다."""
+
+    select_matches = list(re.finditer(r"\bSELECT\b", sql, re.IGNORECASE))
+    if not select_matches:
+        return sql
+    start = select_matches[-1].end()
+    from_match = re.search(r"\bFROM\b", sql[start:], re.IGNORECASE)
+    if not from_match:
+        return sql
+    end = start + from_match.start()
+    parts = _split_projection(sql[start:end])
+    identity_index = next(
+        (
+            index
+            for index, part in enumerate(parts)
+            if re.search(
+                r"\bAS\s+\"?_resource_key\"?\s*$",
+                part,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if identity_index is None:
+        return sql
+
+    def normalize_literal(match: re.Match[str]) -> str:
+        value = match.group(1)
+        if len(value) > 1 and set(value) <= {"-", ":", "|"}:
+            return f"'{value[0]}'"
+        return match.group(0)
+
+    parts[identity_index] = re.sub(
+        r"'((?:''|[^'])*)'",
+        normalize_literal,
+        parts[identity_index],
+    )
+    return sql[:start] + ",".join(parts).rstrip() + "\n" + sql[end:]
+
+
+def repair_encounter_identity(
+    sql: str,
+    catalog: SourceSchemaCatalog,
+) -> str:
+    """Encounter key 식에서 metadata로 입증되는 단일 식별 컬럼을 복원합니다."""
+
+    alias_tables: dict[str, Any] = {}
+    for match in _RELATION_ALIAS.finditer(sql):
+        schema, table, alias = (
+            value.strip('"') for value in match.groups()
+        )
+        relation = catalog.get(schema, table)
+        if relation is not None:
+            alias_tables[alias.lower()] = relation
+    if not alias_tables:
+        return sql
+
+    select_matches = list(re.finditer(r"\bSELECT\b", sql, re.IGNORECASE))
+    if not select_matches:
+        return sql
+    start = select_matches[-1].end()
+    from_match = re.search(r"\bFROM\b", sql[start:], re.IGNORECASE)
+    if not from_match:
+        return sql
+    end = start + from_match.start()
+    parts = _split_projection(sql[start:end])
+    identity_index = next(
+        (
+            index
+            for index, part in enumerate(parts)
+            if re.search(
+                r"\bAS\s+\"?_encounter_key\"?\s*$",
+                part,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if identity_index is None:
+        return sql
+
+    column_pattern = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\."
+        r"\"?([A-Za-z_][A-Za-z0-9_]*)\"?",
+        re.IGNORECASE,
+    )
+    used_elsewhere = {
+        (alias.lower(), column.lower())
+        for index, part in enumerate(parts)
+        if index != identity_index
+        for alias, column in column_pattern.findall(part)
+    }
+    candidates: list[tuple[str, str]] = []
+    for alias, column in column_pattern.findall(parts[identity_index]):
+        normalized_alias = alias.lower()
+        normalized_column = column.lower()
+        relation = alias_tables.get(normalized_alias)
+        if relation is None:
+            continue
+        if normalized_column not in {
+            item.name.lower() for item in relation.columns
+        }:
+            continue
+        candidate = (normalized_alias, column)
+        if (
+            (normalized_alias, normalized_column) not in used_elsewhere
+            and candidate not in candidates
+        ):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        return sql
+
+    alias, column = candidates[0]
+    escaped = column.replace('"', '""')
+    indentation = re.match(r"\s*", parts[identity_index]).group(0)
+    parts[identity_index] = (
+        f'{indentation}CAST({alias}."{escaped}" AS TEXT) '
+        "AS _encounter_key"
+    )
+    return sql[:start] + ",".join(parts).rstrip() + "\n" + sql[end:]
+
+
+def neutralize_invented_optional_aliases(
+    sql: str,
+    required_aliases: set[str] | None = None,
+) -> str:
     """선택 alias 표현의 임의 문자열을 NULL로 바꾸고 원본 SQL은 trace에 남깁니다."""
 
     select_matches = list(re.finditer(r"\bSELECT\b", sql, re.IGNORECASE))
@@ -114,7 +306,11 @@ def neutralize_invented_optional_aliases(sql: str) -> str:
             for literal in _STRING_LITERAL.findall(part)
             if literal not in {"'-'", "':'", "'|'"}
         ]
-        if alias in _OPTIONAL_SOURCE_ALIASES and disallowed_literals:
+        if (
+            alias in _SOURCE_ALIASES
+            and alias not in (required_aliases or set())
+            and disallowed_literals
+        ):
             indentation = re.match(r"\s*", part).group(0)
             normalized.append(f"{indentation}NULL AS {alias}")
         else:
@@ -186,6 +382,7 @@ def _cte_output_columns(sql: str) -> dict[str, set[str]]:
 def _neutralize_unverified_optional_columns(
     sql: str,
     alias_columns: dict[str, set[str]],
+    required_aliases: set[str] | None = None,
 ) -> str:
     """metadata로 확인되지 않는 컬럼이 든 선택 출력 식은 NULL로 낮춥니다."""
 
@@ -216,7 +413,16 @@ def _neutralize_unverified_optional_columns(
                 part,
             )
         )
-        if output_alias in _OPTIONAL_SOURCE_ALIASES and invalid:
+        protected = (
+            required_aliases
+            if required_aliases is not None
+            else _REQUIRED_SOURCE_ALIASES
+        )
+        if (
+            output_alias in _SOURCE_ALIASES
+            and output_alias not in protected
+            and invalid
+        ):
             indentation = re.match(r"\s*", part).group(0)
             normalized.append(f"{indentation}NULL AS {output_alias}")
         else:
@@ -224,7 +430,11 @@ def _neutralize_unverified_optional_columns(
     return sql[:start] + ",".join(normalized).rstrip() + "\n" + sql[end:]
 
 
-def repair_undefined_aliases(sql: str, catalog: SourceSchemaCatalog) -> str:
+def repair_undefined_aliases(
+    sql: str,
+    catalog: SourceSchemaCatalog,
+    required_aliases: set[str] | None = None,
+) -> str:
     """명백히 잘못된 alias.column만 DB metadata를 근거로 교정합니다."""
 
     alias_columns: dict[str, set[str]] = {}
@@ -247,7 +457,9 @@ def repair_undefined_aliases(sql: str, catalog: SourceSchemaCatalog) -> str:
             alias_columns[alias] = cte_columns[relation_name]
     if not alias_columns:
         return sql
-    sql = _neutralize_unverified_optional_columns(sql, alias_columns)
+    sql = _neutralize_unverified_optional_columns(
+        sql, alias_columns, required_aliases
+    )
 
     equality_edges: dict[str, set[tuple[str, str]]] = {}
     for left_alias, left_column, right_alias, right_column in re.findall(
@@ -311,6 +523,258 @@ def repair_undefined_aliases(sql: str, catalog: SourceSchemaCatalog) -> str:
             flags=re.IGNORECASE,
         )
     return sql
+
+
+def repair_repeated_resource_identity(
+    sql: str,
+    catalog: SourceSchemaCatalog,
+) -> str:
+    """반복 실패 SQL의 event-row key를 catalog 근거로 결정적으로 보강합니다."""
+
+    alias_tables: dict[str, Any] = {}
+    for match in _RELATION_ALIAS.finditer(sql):
+        schema, table, alias = (
+            value.strip('"') for value in match.groups()
+        )
+        relation = catalog.get(schema, table)
+        if relation is not None:
+            alias_tables[alias.lower()] = relation
+    if not alias_tables:
+        return sql
+
+    select_matches = list(re.finditer(r"\bSELECT\b", sql, re.IGNORECASE))
+    if not select_matches:
+        return sql
+    start = select_matches[-1].end()
+    from_match = re.search(r"\bFROM\b", sql[start:], re.IGNORECASE)
+    if not from_match:
+        return sql
+    end = start + from_match.start()
+    projection = sql[start:end]
+
+    parts: list[str] = []
+    part_start = 0
+    depth = 0
+    in_string = False
+    index = 0
+    while index < len(projection):
+        char = projection[index]
+        if char == "'":
+            if (
+                in_string
+                and index + 1 < len(projection)
+                and projection[index + 1] == "'"
+            ):
+                index += 2
+                continue
+            in_string = not in_string
+        elif not in_string:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                parts.append(projection[part_start:index])
+                part_start = index + 1
+        index += 1
+    parts.append(projection[part_start:])
+
+    identity_index = next(
+        (
+            index
+            for index, part in enumerate(parts)
+            if re.search(
+                r"\bAS\s+\"?_resource_key\"?\s*$",
+                part,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if identity_index is None:
+        return sql
+
+    code_part = next(
+        (
+            part
+            for part in parts
+            if re.search(
+                r"\bAS\s+\"?_code\"?\s*$", part, re.IGNORECASE
+            )
+        ),
+        "",
+    )
+    identity_part = parts[identity_index]
+    source_alias = next(
+        (
+            alias
+            for alias in re.findall(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\."
+                r"\"?[A-Za-z_][A-Za-z0-9_]*\"?",
+                code_part + "\n" + identity_part,
+            )
+            if alias.lower() in alias_tables
+        ),
+        None,
+    )
+    if source_alias is None:
+        return sql
+
+    relation = alias_tables[source_alias.lower()]
+    primary_keys = [
+        column.name for column in relation.columns if column.primary_key
+    ]
+    if len(primary_keys) == 1:
+        expression = (
+            f'{source_alias}."{primary_keys[0].replace(chr(34), chr(34) * 2)}"'
+            "::text"
+        )
+    elif primary_keys:
+        columns = ", ".join(
+            f'{source_alias}."{name.replace(chr(34), chr(34) * 2)}"::text'
+            for name in primary_keys
+        )
+        expression = f"concat_ws('|', {columns})"
+    else:
+        # PK metadata가 없는 relation은 source event row 자체를 사용합니다.
+        # join된 dictionary row는 포함하지 않아 join 증식이 계속 검출됩니다.
+        expression = f"md5(to_jsonb({source_alias})::text)"
+
+    indentation = re.match(r"\s*", identity_part).group(0)
+    parts[identity_index] = (
+        f"{indentation}{expression} AS _resource_key"
+    )
+    return sql[:start] + ",".join(parts).rstrip() + "\n" + sql[end:]
+
+
+def repair_invented_projection_literals(
+    sql: str,
+    catalog: SourceSchemaCatalog,
+) -> str:
+    """발명된 projection 값을 유일한 catalog 근거 컬럼으로 교체합니다."""
+
+    alias_tables: dict[str, Any] = {}
+    for match in _RELATION_ALIAS.finditer(sql):
+        schema, table, alias = (
+            value.strip('"') for value in match.groups()
+        )
+        relation = catalog.get(schema, table)
+        if relation is not None:
+            alias_tables[alias.lower()] = relation
+    if not alias_tables:
+        return sql
+
+    pattern = re.compile(
+        r"(?P<expression>"
+        r"\bCASE\b.*?\bEND"
+        r"|'(?:''|[^'])*'"
+        r")\s+AS\s+\"?(?P<output_alias>_[A-Za-z0-9_]+)\"?",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def replacement(match: re.Match[str]) -> str:
+        output_alias = match.group("output_alias")
+        suffix = output_alias.strip("_").split("_")[-1].lower()
+        candidates = [
+            (table_alias, column.name)
+            for table_alias, relation in alias_tables.items()
+            for column in relation.columns
+            if column.name.lower().replace("_", "").endswith(suffix)
+        ]
+        if len(candidates) != 1:
+            return match.group(0)
+        table_alias, column_name = candidates[0]
+        return f"{table_alias}.{column_name} AS {output_alias}"
+
+    repaired = pattern.sub(replacement, sql)
+    repaired = re.sub(r"\s*\|\|\s*''", "", repaired)
+    return re.sub(r"''\s*\|\|\s*", "", repaired)
+
+
+def repair_scoped_encounter_key(
+    sql: str,
+    encounter_scope: tuple[int | str, ...] | None = None,
+) -> str:
+    """요청 Encounter 집합과 일치하는 IN predicate 컬럼을 출력에 재사용합니다."""
+
+    scope_matches = list(re.finditer(
+        r"(?:CAST\s*\(\s*)?"
+        r"(?P<table_alias>[A-Za-z_][A-Za-z0-9_]*)\."
+        r"(?P<column>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*\))?"
+        r"\s+IN\s*\((?P<values>[^()]*)\)",
+        sql,
+        re.IGNORECASE,
+    ))
+    if not scope_matches:
+        return sql
+
+    scope_match: re.Match[str] | None = None
+    expected = (
+        {str(value) for value in encounter_scope}
+        if encounter_scope
+        else set()
+    )
+    if expected:
+        matching: list[re.Match[str]] = []
+        for candidate in scope_matches:
+            raw_values = candidate.group("values")
+            if re.search(r"\bSELECT\b", raw_values, re.IGNORECASE):
+                continue
+            parsed = {
+                (
+                    token[1:-1].replace("''", "'")
+                    if token.startswith("'")
+                    else token
+                )
+                for token in re.findall(
+                    r"'(?:''|[^'])*'|[-+]?\d+(?:\.\d+)?",
+                    raw_values,
+                )
+            }
+            if parsed == expected:
+                matching.append(candidate)
+        if len(matching) == 1:
+            scope_match = matching[0]
+    if scope_match is None and len(scope_matches) == 1:
+        scope_match = scope_matches[0]
+    if scope_match is None:
+        return sql
+
+    select_match = re.search(
+        r"\bSELECT\b(?P<projection>.*?)\bFROM\b",
+        sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if select_match is None:
+        return sql
+    projection = select_match.group("projection")
+    parts = _split_projection(projection)
+    encounter_index = next(
+        (
+            index
+            for index, part in enumerate(parts)
+            if re.search(
+                r"\bAS\s+\"?_encounter_key\"?\s*$",
+                part,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if encounter_index is None:
+        return sql
+
+    indentation = re.match(r"\s*", parts[encounter_index]).group(0)
+    table_alias = scope_match.group("table_alias")
+    column = scope_match.group("column")
+    parts[encounter_index] = (
+        f"{indentation}CAST({table_alias}.{column} AS TEXT) "
+        "AS _encounter_key"
+    )
+    repaired_projection = ",".join(parts)
+    start, end = select_match.span("projection")
+    return sql[:start] + repaired_projection + sql[end:]
 
 
 @dataclass(frozen=True)
@@ -554,6 +1018,9 @@ class NaturalLanguageSqlAgent:
         question: str,
         max_attempts: int | None = None,
         result_validator: Callable[[list[dict[str, Any]]], None] | None = None,
+        required_aliases: set[str] | None = None,
+        expected_aliases: tuple[str, ...] | None = None,
+        encounter_scope: tuple[int | str, ...] | None = None,
     ) -> SqlAnswer:
         context = self._schema_context(question)
         policy = getattr(self.gateway, "policy", None)
@@ -568,6 +1035,7 @@ class NaturalLanguageSqlAgent:
         attempts = max_attempts or self.settings.llm_sql_max_attempts
         previous_error = ""
         previous_sql = ""
+        previous_category = ""
         failure_categories: list[str] = []
         attempt_traces: list[SqlAttemptTrace] = []
         for attempt in range(1, attempts + 1):
@@ -575,7 +1043,9 @@ class NaturalLanguageSqlAgent:
                 "\nPrevious SQL attempt failed. Correct the SQL using both the "
                 "previous statement and validation error.\n"
                 f"Previous SQL:\n{previous_sql[:4000]}\n"
-                f"Validation error:\n{previous_error[:2000]}\n"
+                f"Validation error and required correction:\n"
+                f"{previous_error[:4000]}\n"
+                "Do not return a previous failed SQL statement unchanged.\n"
                 if previous_error
                 else ""
             )
@@ -585,14 +1055,17 @@ class NaturalLanguageSqlAgent:
 User question: {question}
 Allowed schema-qualified tables discovered from PostgreSQL: {allowed}
 {correction}
-Return JSON only with these fields:
+Return JSON only with this field:
 - sql: one PostgreSQL SELECT statement
-- explanation: short Korean explanation
 Never invent columns. Do not use DDL/DML.
 Always qualify source tables as schema.table.
 Every clinical output value must come from a documented source column. Never
 emit placeholder text or another quoted string literal as a SELECT output;
 return NULL when the source has no value.
+Use PostgreSQL syntax only. Build a composite _resource_key with source-column
+CAST(... AS TEXT) expressions joined by || and separator literals. Do not hash
+the key and do not use TO_HEX, TO_TEXT, TO_JSON_STRING, or another
+non-PostgreSQL conversion function.
 Any quoted literal in the SELECT projection is a hard failure, including
 labels used for type, status, category, code system, or display.
 Treat requested output names as SELECT aliases, not as evidence that physical
@@ -618,14 +1091,49 @@ schema context; changing only the filter syntax is not a correction.
                     failure_categories.append(category)
                     raise exc
                 try:
-                    execution_sql = neutralize_invented_optional_aliases(
-                        proposed_sql
+                    execution_sql = normalize_output_aliases(
+                        proposed_sql, expected_aliases
                     )
                     catalog = getattr(self.gateway, "catalog", None)
                     if isinstance(catalog, SourceSchemaCatalog):
-                        execution_sql = repair_undefined_aliases(
+                        if (
+                            required_aliases
+                            and "_encounter_key" in required_aliases
+                            and "_resource_key" not in required_aliases
+                        ):
+                            execution_sql = repair_encounter_identity(
+                                execution_sql, catalog
+                            )
+                        if (
+                            required_aliases
+                            and {
+                                "_encounter_key",
+                                "_resource_key",
+                            } <= required_aliases
+                        ):
+                            execution_sql = repair_scoped_encounter_key(
+                                execution_sql,
+                                encounter_scope,
+                            )
+                        execution_sql = repair_invented_projection_literals(
                             execution_sql, catalog
                         )
+                        if (
+                            previous_category == "result_resource_identity"
+                            and proposed_sql.strip() == previous_sql.strip()
+                        ):
+                            execution_sql = repair_repeated_resource_identity(
+                                execution_sql, catalog
+                            )
+                        execution_sql = repair_undefined_aliases(
+                            execution_sql, catalog, required_aliases
+                        )
+                    execution_sql = normalize_resource_key_separators(
+                        execution_sql
+                    )
+                    execution_sql = neutralize_invented_optional_aliases(
+                        execution_sql, required_aliases
+                    )
                     safe_sql = self.gateway.validate(execution_sql)
                     sql, rows = self.gateway.execute(execution_sql)
                 except ValueError as exc:
@@ -676,48 +1184,62 @@ schema context; changing only the filter syntax is not a correction.
                 schema_hint = getattr(self.gateway, "schema_hint", None)
                 if proposed_sql and callable(schema_hint):
                     focused_schema = str(schema_hint(proposed_sql))
-                previous_error = (
-                    (
-                        "Exact columns for referenced and structurally related tables:\n"
-                        + focused_schema
-                        + "\n"
-                    )
-                    if focused_schema
-                    else ""
-                ) + f"{type(exc).__name__}: {exc}"
+                guidance = ""
                 if (
                     isinstance(exc, ValueError)
                     and "임의 문자열 상수" in str(exc)
                 ):
-                    previous_error += (
-                        "\nCorrection required: set _code_system, _unit_system "
-                        "and _unit_code to NULL unless a documented source column "
-                        "stores that value. Build _resource_key only from source "
-                        "columns; '-', ':' and '|' separators are allowed."
+                    guidance += (
+                        "Correction required: remove every quoted string literal "
+                        "from SELECT output expressions, regardless of alias. "
+                        "For each output alias, select an actual documented "
+                        "source column or return NULL when that alias is optional. "
+                        "Required aliases such as encounter type and clinical "
+                        "code must use a documented non-null source column. "
+                        "Only single-character '-', ':' and '|' separators "
+                        "inside a composite _resource_key are allowed.\n"
                     )
                 if (
                     isinstance(exc, SqlResultValidationError)
                     and exc.category == "result_required_value"
                 ):
-                    previous_error += (
-                        "\nCorrection required: a required output alias was NULL. "
+                    guidance += (
+                        "Correction required: a required output alias was NULL. "
                         "Select an actual documented source column with that "
                         "semantic role from the chosen clinical relation. If the "
                         "relation has no such column, choose another relation. "
-                        "Do not return NULL for the required alias again."
+                        "Do not return NULL for the required alias again.\n"
                     )
                 if (
                     isinstance(exc, SqlResultValidationError)
                     and exc.category == "result_resource_identity"
                 ):
-                    previous_error += (
-                        "\nCorrection required: _resource_key must identify each "
+                    guidance += (
+                        "Correction required: _resource_key must identify each "
                         "returned event row, not only its parent patient, visit, "
-                        "encounter, or stay. Use a documented event-row key or "
-                        "combine enough documented event columns to be non-null "
-                        "and unique. Verify uniqueness before returning SQL."
+                        "encounter, code, or stay. Rebuild it from the selected "
+                        "event relation's documented primary-key columns when "
+                        "available. Otherwise combine documented event-level ID, "
+                        "sequence, order, timestamp, or code columns until the "
+                        "key is stable, non-null, and unique. Preserve distinct "
+                        "source events; do not hide collisions with DISTINCT, "
+                        "GROUP BY, row_number, or a result-position value. Also "
+                        "check that dictionary joins do not multiply source rows.\n"
                     )
+                previous_error = (
+                    f"{type(exc).__name__}: {exc}\n"
+                    + guidance
+                    + (
+                        "Exact columns for referenced and structurally related "
+                        "tables:\n"
+                        + focused_schema[:2500]
+                        + "\n"
+                        if focused_schema
+                        else ""
+                    )
+                )
                 previous_sql = proposed_sql
+                previous_category = category
                 attempt_traces.append(
                     SqlAttemptTrace(
                         attempt=attempt,

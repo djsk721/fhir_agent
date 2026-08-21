@@ -1,7 +1,9 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 from fhir_agent_pipeline.config import load_settings
 from fhir_agent_pipeline.validation import (
+    _run_external_validator,
     _validator_issue_counts,
     validate_bundle_detailed,
 )
@@ -69,6 +71,35 @@ def test_validator_severity_output_is_structured() -> None:
         "[3,4] Bundle: Information - checked"
     )
     assert counts == {"fatal": 0, "error": 1, "warning": 1, "information": 1}
+
+
+def test_external_validator_uses_configured_terminology_server(
+    monkeypatch, tmp_path
+) -> None:
+    jar = tmp_path / "validator.jar"
+    jar.write_bytes(b"jar")
+    captured: list[str] = []
+
+    def run(command, **_kwargs):
+        captured.extend(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "fhir_agent_pipeline.validation.subprocess.run",
+        run,
+    )
+
+    result = _run_external_validator(
+        valid_bundle(),
+        jar,
+        "4.0.1",
+        120,
+        10_000,
+        "n/a",
+    )
+
+    assert result.used
+    assert captured[-2:] == ["-tx", "n/a"]
 
 
 def test_bundle_does_not_require_absent_optional_clinical_resources() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import gzip
 import json
 from pathlib import Path
@@ -284,7 +284,11 @@ class FhirBatchExportService:
                     not isinstance(prior_evaluation, dict)
                     or prior_evaluation.get("task_quality_pass") is True
                 )
-                if report.get("valid") and task_passed:
+                validator_compatible = (
+                    self._settings.fhir_validator_jar is None
+                    or report.get("external_validator_used") is True
+                )
+                if report.get("valid") and task_passed and validator_compatible:
                     records.append(
                         {
                             "patient_key": patient_key,
@@ -303,7 +307,11 @@ class FhirBatchExportService:
                     _write_json_atomic(manifest_path, manifest())
                     continue
             try:
-                result = LlmSqlToFhirPipeline(self._settings).run(patient_key)
+                pipeline_settings = replace(
+                    self._settings,
+                    fhir_validator_jar=None,
+                )
+                result = LlmSqlToFhirPipeline(pipeline_settings).run(patient_key)
                 _write_json_atomic(bundle_path, result.fhir_payload)
                 trace_payload = (
                     result.trace_dict()
@@ -324,6 +332,7 @@ class FhirBatchExportService:
                         build_performance_metrics(report, task_evaluation)
                     )
                 _write_json_atomic(validation_path, report)
+                failure_path.unlink(missing_ok=True)
                 records.append(
                     {
                         "patient_key": patient_key,
@@ -336,8 +345,8 @@ class FhirBatchExportService:
                         "source_row_counts": getattr(
                             result, "source_row_counts", {}
                         ),
-                        "generation_metrics": getattr(
-                            result, "generation_metrics", {}
+                        "rendering_metrics": getattr(
+                            result, "rendering_metrics", {}
                         ),
                         "sql_generation_metrics": trace_payload.get(
                             "sql_generation_metrics", {}
@@ -373,8 +382,8 @@ class FhirBatchExportService:
                     "source_row_counts": failure_trace.get(
                         "source_row_counts", {}
                     ),
-                    "generation_metrics": failure_trace.get(
-                        "generation_metrics", {}
+                    "rendering_metrics": failure_trace.get(
+                        "rendering_metrics", {}
                     ),
                     "sql_generation_metrics": failure_trace.get(
                         "sql_generation_metrics", {}

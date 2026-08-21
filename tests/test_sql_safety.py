@@ -1,6 +1,12 @@
+from fhir_agent_pipeline.db import (
+    SourceColumn,
+    SourceSchemaCatalog,
+    SourceTable,
+)
 from fhir_agent_pipeline.sql_agent import (
     SqlSafetyPolicy,
     neutralize_invented_optional_aliases,
+    repair_repeated_resource_identity,
 )
 
 
@@ -75,3 +81,55 @@ def test_optional_alias_guard_handles_outer_select_after_cte() -> None:
     normalized = neutralize_invented_optional_aliases(sql)
 
     assert "NULL AS _display" in normalized
+
+
+def test_repeated_identity_uses_catalog_primary_key_without_source_mapping() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "event",
+            (
+                SourceColumn("event_id", "INTEGER", True),
+                SourceColumn("code", "TEXT", False),
+            ),
+            (),
+        ),
+    ))
+    sql = (
+        "SELECT e.code AS _resource_key, e.code AS _code "
+        "FROM clinical.event AS e"
+    )
+
+    repaired = repair_repeated_resource_identity(sql, catalog)
+
+    assert 'e."event_id"::text AS _resource_key' in repaired
+
+
+def test_repeated_identity_hashes_source_row_when_catalog_has_no_pk() -> None:
+    catalog = SourceSchemaCatalog((
+        SourceTable(
+            "clinical",
+            "event",
+            (
+                SourceColumn("sequence", "INTEGER", False),
+                SourceColumn("code", "TEXT", False),
+            ),
+            (),
+        ),
+        SourceTable(
+            "clinical",
+            "dictionary",
+            (SourceColumn("code", "TEXT", False),),
+            (),
+        ),
+    ))
+    sql = (
+        "SELECT e.code AS _resource_key, e.code AS _code, d.code AS _display "
+        "FROM clinical.event AS e "
+        "JOIN clinical.dictionary AS d ON e.code = d.code"
+    )
+
+    repaired = repair_repeated_resource_identity(sql, catalog)
+
+    assert "md5(to_jsonb(e)::text) AS _resource_key" in repaired
+    assert "to_jsonb(d)" not in repaired

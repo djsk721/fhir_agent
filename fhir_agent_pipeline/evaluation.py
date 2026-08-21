@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .normalization import normalize_administrative_gender
 from .source_contract import (
     encounter_reference,
     patient_reference,
@@ -123,6 +124,11 @@ def evaluate_task_output(
     observation_time = _Score()
     per_type: dict[str, _Score] = {}
     identity_metrics: dict[str, dict[str, int | float]] = {}
+    generated_encounter_refs = {
+        encounter_reference(resource["id"])
+        for resource in generated_resources.get("Encounter", [])
+        if resource.get("id")
+    }
     count_alignment: dict[str, dict[str, int | float]] = {}
 
     for resource_type, rows in source_rows.items():
@@ -145,13 +151,9 @@ def evaluate_task_output(
             check(resource.get("resourceType"), resource_type)
             check(resource.get("id"), stable_resource_id(resource_type, row))
             if resource_type == "Patient":
-                gender = str(row.get("_gender") or "").upper()
-                expected_gender = {
-                    "M": "male", "MALE": "male",
-                    "F": "female", "FEMALE": "female",
-                    "O": "other", "OTHER": "other",
-                    "U": "unknown", "UNKNOWN": "unknown",
-                }.get(gender)
+                expected_gender = normalize_administrative_gender(
+                    row.get("_gender")
+                )
                 if expected_gender:
                     check(resource.get("gender"), expected_gender)
                 death = row.get("_death_datetime")
@@ -180,11 +182,25 @@ def evaluate_task_output(
                         )
                 continue
 
-            expected_encounter = encounter_reference(row["_encounter_key"])
+            encounter_key = row.get("_encounter_key")
+            source_encounter = (
+                encounter_reference(encounter_key)
+                if encounter_key not in (None, "")
+                else None
+            )
             actual_encounter = _path(resource, "encounter", "reference")
-            check(actual_encounter, expected_encounter)
-            reference.add(actual_encounter, expected_encounter)
-            encounter_ref_score.add(actual_encounter, expected_encounter)
+            encounter_is_evaluable = (
+                resource_type != "Observation"
+                or source_encounter in generated_encounter_refs
+                or actual_encounter is not None
+            )
+            if encounter_is_evaluable:
+                check(actual_encounter, source_encounter)
+                if source_encounter is not None:
+                    reference.add(actual_encounter, source_encounter)
+                    encounter_ref_score.add(
+                        actual_encounter, source_encounter
+                    )
 
             code = row.get("_code")
             if code is not None:
@@ -250,7 +266,8 @@ def evaluate_task_output(
     )
     return {
         "evaluation_basis": (
-            "LLM SQL generic aliases matched to LLM FHIR resources by stable source keys"
+            "LLM SQL generic aliases matched to deterministic FHIR resources "
+            "by stable source keys"
         ),
         "task_quality_pass": task_pass,
         "source_field_accuracy": overall.as_dict(),

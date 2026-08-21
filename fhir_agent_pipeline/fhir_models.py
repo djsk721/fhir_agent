@@ -4,6 +4,8 @@ from copy import deepcopy
 from typing import Any, Iterable
 from uuid import NAMESPACE_URL, uuid5
 
+from .resource_definition import ordered_definitions
+
 
 def build_bundle(
     resources: Iterable[dict[str, Any]], namespace: str = "fhir-source"
@@ -44,3 +46,44 @@ def build_bundle(
             }
         )
     return {"resourceType": "Bundle", "type": "collection", "entry": entries}
+
+
+def build_bundle_pages(
+    resources: Iterable[dict[str, Any]],
+    *,
+    namespace: str = "fhir-source",
+    observation_page_size: int | None = None,
+) -> list[dict[str, Any]]:
+    """기본 리소스와 대량 Observation을 독립 Bundle page로 분리합니다."""
+
+    paginated = [
+        definition
+        for definition in ordered_definitions()
+        if definition.pagination_enabled
+    ]
+    if len(paginated) != 1:
+        raise ValueError("페이지 분할 대상 FHIR 리소스는 정확히 하나여야 합니다.")
+    definition = paginated[0]
+    page_size = observation_page_size or definition.page_size
+    if page_size < 1:
+        raise ValueError("observation_page_size는 1 이상이어야 합니다.")
+    resource_list = list(resources)
+    base = [
+        resource
+        for resource in resource_list
+        if resource.get("resourceType") != definition.resource_type
+    ]
+    observations = [
+        resource
+        for resource in resource_list
+        if resource.get("resourceType") == definition.resource_type
+    ]
+    pages = [build_bundle(base, namespace=namespace)]
+    pages.extend(
+        build_bundle(
+            observations[start : start + page_size],
+            namespace=namespace,
+        )
+        for start in range(0, len(observations), page_size)
+    )
+    return pages

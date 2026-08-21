@@ -7,6 +7,10 @@ import re
 
 from dotenv import load_dotenv
 
+from .resource_definition import (
+    ordered_definitions,
+    supported_resource_types,
+)
 from .source_profile import SourceProfile
 
 
@@ -29,9 +33,6 @@ class Settings:
     ollama_max_retries: int
     ollama_retry_delay_seconds: int
     llm_sql_max_attempts: int
-    llm_fhir_max_attempts: int
-    llm_fhir_batch_size: int
-    llm_fhir_context_search_k: int
     embedding_dimension: int
     fhir_schema_path: Path
     vector_schema: str
@@ -54,6 +55,7 @@ class Settings:
     fhir_version: str
     fhir_validator_timeout_seconds: int
     fhir_validator_max_output_chars: int
+    fhir_validator_terminology_server: str | None
     vector_batch_size: int
     source_profile_path: Path
 
@@ -81,28 +83,38 @@ def _integer(name: str, default: int) -> int:
         raise ValueError(f"{name}은 정수여야 합니다: {raw!r}") from exc
 
 
+def _required_integer(name: str) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        raise ValueError(f"{name} 환경 변수가 필요합니다.")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}은 정수여야 합니다: {raw!r}") from exc
+
+
 def _validate_settings(settings: Settings) -> None:
     bounded_values = {
         "EMBEDDING_DIMENSION": (settings.embedding_dimension, 1, None),
         "VECTOR_SEARCH_K": (settings.vector_search_k, 1, 100),
-        "SQL_MAX_ROWS": (settings.sql_max_rows, 1, 10_000),
+        "SQL_MAX_ROWS": (settings.sql_max_rows, 1, None),
         "SQL_STATEMENT_TIMEOUT_MS": (settings.sql_statement_timeout_ms, 1, None),
         "DB_CONNECT_TIMEOUT_SECONDS": (settings.db_connect_timeout_seconds, 1, None),
-        "SOURCE_MAX_ENCOUNTERS": (settings.max_encounters, 1, 100),
+        "SOURCE_MAX_ENCOUNTERS": (settings.max_encounters, 1, None),
         "SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER": (
             settings.max_observations_per_encounter,
             1,
-            10_000,
+            None,
         ),
         "SOURCE_MAX_CONDITIONS_PER_ENCOUNTER": (
             settings.max_conditions_per_encounter,
             1,
-            10_000,
+            None,
         ),
         "SOURCE_MAX_PROCEDURES_PER_ENCOUNTER": (
             settings.max_procedures_per_encounter,
             1,
-            10_000,
+            None,
         ),
         "OLLAMA_TIMEOUT_SECONDS": (settings.ollama_timeout_seconds, 1, None),
         "OLLAMA_CONTEXT_SIZE": (settings.ollama_context_size, 1, None),
@@ -114,13 +126,6 @@ def _validate_settings(settings: Settings) -> None:
             60,
         ),
         "LLM_SQL_MAX_ATTEMPTS": (settings.llm_sql_max_attempts, 1, 5),
-        "LLM_FHIR_MAX_ATTEMPTS": (settings.llm_fhir_max_attempts, 1, 5),
-        "LLM_FHIR_BATCH_SIZE": (settings.llm_fhir_batch_size, 1, 20),
-        "LLM_FHIR_CONTEXT_SEARCH_K": (
-            settings.llm_fhir_context_search_k,
-            1,
-            100,
-        ),
         "FHIR_VALIDATOR_TIMEOUT_SECONDS": (
             settings.fhir_validator_timeout_seconds,
             1,
@@ -138,8 +143,6 @@ def _validate_settings(settings: Settings) -> None:
             upper = f"~{maximum}" if maximum is not None else " 이상"
             raise ValueError(f"{name}은 {minimum}{upper} 범위여야 합니다.")
 
-    from .resource_registry import selected_adapters, supported_resource_types
-
     supported = supported_resource_types()
     unknown = set(settings.fhir_output_resources) - supported
     if unknown:
@@ -147,7 +150,7 @@ def _validate_settings(settings: Settings) -> None:
     selected = set(settings.fhir_output_resources)
     missing_dependencies = {
         adapter.resource_type: sorted(set(adapter.dependencies) - selected)
-        for adapter in selected_adapters(settings.fhir_output_resources)
+        for adapter in ordered_definitions(settings.fhir_output_resources)
         if set(adapter.dependencies) - selected
     }
     if missing_dependencies:
@@ -212,9 +215,6 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
         ollama_max_retries=_integer("OLLAMA_MAX_RETRIES", 2),
         ollama_retry_delay_seconds=_integer("OLLAMA_RETRY_DELAY_SECONDS", 2),
         llm_sql_max_attempts=_integer("LLM_SQL_MAX_ATTEMPTS", 3),
-        llm_fhir_max_attempts=_integer("LLM_FHIR_MAX_ATTEMPTS", 2),
-        llm_fhir_batch_size=_integer("LLM_FHIR_BATCH_SIZE", 2),
-        llm_fhir_context_search_k=_integer("LLM_FHIR_CONTEXT_SEARCH_K", 20),
         embedding_dimension=_integer("EMBEDDING_DIMENSION", 768),
         fhir_schema_path=_path("FHIR_SCHEMA_PATH", PROJECT_ROOT / "db" / "fhir.schema.json"),
         vector_schema=os.getenv("VECTOR_SCHEMA", "public").strip() or "public",
@@ -222,22 +222,25 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
         sql_vector_table=os.getenv("SQL_VECTOR_TABLE", "source_sql_schema_vectors").strip(),
         vector_search_k=_integer("VECTOR_SEARCH_K", 6),
         vectors_enabled=_bool("VECTORS_ENABLED", True),
-        sql_max_rows=_integer("SQL_MAX_ROWS", 100),
+        sql_max_rows=_required_integer("SQL_MAX_ROWS"),
         sql_statement_timeout_ms=_integer("SQL_STATEMENT_TIMEOUT_MS", 15_000),
         db_connect_timeout_seconds=_integer("DB_CONNECT_TIMEOUT_SECONDS", 5),
-        max_encounters=_integer("SOURCE_MAX_ENCOUNTERS", 1),
-        max_observations_per_encounter=_integer(
-            "SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER", 10
+        max_encounters=_required_integer("SOURCE_MAX_ENCOUNTERS"),
+        max_observations_per_encounter=_required_integer(
+            "SOURCE_MAX_OBSERVATIONS_PER_ENCOUNTER"
         ),
-        max_conditions_per_encounter=_integer(
-            "SOURCE_MAX_CONDITIONS_PER_ENCOUNTER", 10
+        max_conditions_per_encounter=_required_integer(
+            "SOURCE_MAX_CONDITIONS_PER_ENCOUNTER"
         ),
-        max_procedures_per_encounter=_integer(
-            "SOURCE_MAX_PROCEDURES_PER_ENCOUNTER", 10
+        max_procedures_per_encounter=_required_integer(
+            "SOURCE_MAX_PROCEDURES_PER_ENCOUNTER"
         ),
         fhir_output_resources=_csv(
             resources_raw,
-            ["Patient", "Encounter", "Condition", "Procedure", "Observation"],
+            [
+                definition.resource_type
+                for definition in ordered_definitions()
+            ],
         ),
         fhir_validator_jar=Path(validator_raw).expanduser().resolve() if validator_raw else None,
         fhir_output_path=_path("FHIR_OUTPUT_PATH", PROJECT_ROOT / "fhir_output" / "bundle.json"),
@@ -249,6 +252,10 @@ def load_settings(env_file: str | None = None, require_database: bool = True) ->
         fhir_validator_timeout_seconds=_integer("FHIR_VALIDATOR_TIMEOUT_SECONDS", 120),
         fhir_validator_max_output_chars=_integer(
             "FHIR_VALIDATOR_MAX_OUTPUT_CHARS", 10_000
+        ),
+        fhir_validator_terminology_server=(
+            os.getenv("FHIR_VALIDATOR_TERMINOLOGY_SERVER", "").strip()
+            or None
         ),
         vector_batch_size=_integer("VECTOR_BATCH_SIZE", 64),
         source_profile_path=source_profile_path,

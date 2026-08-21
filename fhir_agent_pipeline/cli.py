@@ -63,12 +63,12 @@ def convert(
     )
     if selected_patient_key is None:
         raise ValueError(
-            "LLM 변환에는 --patient-key 또는 SOURCE_PATIENT_ID가 필요합니다."
+            "FHIR 변환에는 --patient-key 또는 SOURCE_PATIENT_ID가 필요합니다."
         )
     result = LlmSqlToFhirPipeline(settings).run(
         selected_patient_key, normalize(encounter_key)
     )
-    generation_mode = "llm-sql-and-llm-fhir"
+    generation_mode = "llm-sql-and-deterministic-fhir"
     trace = result.trace_dict()
     validation = (
         result.validation_report.as_dict()

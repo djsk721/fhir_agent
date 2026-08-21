@@ -125,6 +125,7 @@ def _run_external_validator(
     version: str,
     timeout_seconds: int,
     max_output_chars: int,
+    terminology_server: str | None,
 ) -> _ExternalValidatorResult:
     if not jar.is_file():
         return _ExternalValidatorResult(
@@ -137,17 +138,20 @@ def _run_external_validator(
         bundle_path = Path(directory) / "bundle.json"
         bundle_path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
         try:
+            command = [
+                "java",
+                "-jar",
+                str(jar),
+                str(bundle_path),
+                "-version",
+                version,
+                "-output-style",
+                "compact",
+            ]
+            if terminology_server:
+                command.extend(["-tx", terminology_server])
             process = subprocess.run(
-                [
-                    "java",
-                    "-jar",
-                    str(jar),
-                    str(bundle_path),
-                    "-version",
-                    version,
-                    "-output-style",
-                    "compact",
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
@@ -242,6 +246,7 @@ def validate_bundle_detailed(bundle: dict[str, Any], settings: Settings) -> Vali
             settings.fhir_version,
             settings.fhir_validator_timeout_seconds,
             settings.fhir_validator_max_output_chars,
+            settings.fhir_validator_terminology_server,
         )
         external_used = external_result.used
         validator_issue_counts = external_result.issue_counts

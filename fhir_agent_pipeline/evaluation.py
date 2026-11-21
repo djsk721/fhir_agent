@@ -74,7 +74,7 @@ def _f1(expected: set[str], generated: set[str]) -> dict[str, int | float]:
         "false_negative": fn,
         "precision": precision,
         "recall": recall,
-        "f1": 1.0 if not precision + recall else 2 * precision * recall / (precision + recall),
+        "f1": 0.0 if not precision + recall else 2 * precision * recall / (precision + recall),
     }
 
 

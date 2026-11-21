@@ -1,0 +1,73 @@
+{
+  "dataset": "synthea",
+  "dataset_version": "unspecified",
+  "generator": {
+    "name": "Synthea",
+    "version": "unspecified",
+    "seed": null,
+    "reference_date": null,
+    "fhir_export_version": "4.0.1"
+  },
+  "schema_version": "v1",
+  "extractor_version": "v1",
+  "resources": {
+    "Patient": {
+      "source_resource": "patients",
+      "schema": "synthea",
+      "table": "patients",
+      "csv_file": "patients.csv",
+      "columns": ["id", "birthdate", "deathdate", "gender"],
+      "primary_keys": ["id"],
+      "identity_fields": ["id"],
+      "foreign_keys": [],
+      "patient_column": "id"
+    },
+    "Encounter": {
+      "source_resource": "encounters",
+      "schema": "synthea",
+      "table": "encounters",
+      "table_description": "One simulated encounter. Encounter class describes the type of visit, unlike the visit's coded service.",
+      "csv_file": "encounters.csv",
+      "columns": ["id", "patient", "encounterclass", "start", "stop", "code", "description"],
+      "primary_keys": ["id"],
+      "identity_fields": ["id"],
+      "sample_group_fields": ["encounterclass"],
+      "foreign_keys": [{"columns": ["patient"], "referred_table": "patients", "referred_columns": ["id"]}],
+      "patient_column": "patient"
+    },
+    "Condition": {
+      "source_resource": "conditions",
+      "schema": "synthea",
+      "table": "conditions",
+      "csv_file": "conditions.csv",
+      "columns": ["patient", "encounter", "system", "code", "description", "start", "stop"],
+      "primary_keys": ["patient", "encounter", "code", "start"],
+      "foreign_keys": [
+        {"columns": ["patient"], "referred_table": "patients", "referred_columns": ["id"]},
+        {"columns": ["encounter"], "referred_table": "encounters", "referred_columns": ["id"]}
+      ],
+      "patient_column": "patient",
+      "encounter_column": "encounter"
+    },
+    "Observation": {
+      "source_resource": "observations",
+      "schema": "synthea",
+      "table": "observations",
+      "csv_file": "observations.csv",
+      "columns": ["patient", "encounter", "category", "code", "description", "date", "value", "units", "type"],
+      "primary_keys": ["patient", "encounter", "code", "date"],
+      "foreign_keys": [
+        {"columns": ["patient"], "referred_table": "patients", "referred_columns": ["id"]},
+        {"columns": ["encounter"], "referred_table": "encounters", "referred_columns": ["id"]}
+      ],
+      "sample_group_fields": ["type"],
+      "column_descriptions": {
+        "type": "Source discriminator for the result in value: numeric or text (CSV stores both as strings)",
+        "value": "Original numeric or textual result, as indicated by type",
+        "units": "Unit text when present for a numeric result"
+      },
+      "patient_column": "patient",
+      "encounter_column": "encounter"
+    }
+  }
+}

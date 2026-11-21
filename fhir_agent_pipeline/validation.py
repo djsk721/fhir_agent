@@ -105,6 +105,8 @@ class _ExternalValidatorResult:
     errors: list[str]
     warnings: list[str]
     issue_counts: dict[str, int]
+    issues: list[dict[str, str]] = field(default_factory=list)
+    status: str = "completed"
 
 
 _VALIDATOR_SEVERITY = re.compile(
@@ -125,6 +127,7 @@ def _run_external_validator(
     version: str,
     timeout_seconds: int,
     max_output_chars: int,
+    terminology_server: str | None = None,
 ) -> _ExternalValidatorResult:
     if not jar.is_file():
         return _ExternalValidatorResult(
@@ -132,13 +135,13 @@ def _run_external_validator(
             [f"FHIR_VALIDATOR_JAR 파일을 찾을 수 없습니다: {jar}"],
             [],
             {"fatal": 0, "error": 0, "warning": 0, "information": 0},
+            status="unavailable",
         )
     with tempfile.TemporaryDirectory(prefix="fhir-validator-") as directory:
         bundle_path = Path(directory) / "bundle.json"
         bundle_path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
         try:
-            process = subprocess.run(
-                [
+            command = [
                     "java",
                     "-jar",
                     str(jar),
@@ -147,21 +150,33 @@ def _run_external_validator(
                     version,
                     "-output-style",
                     "compact",
-                ],
+                ]
+            if terminology_server:
+                command.extend(["-tx", terminology_server])
+            process = subprocess.run(
+                command,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             return _ExternalValidatorResult(
                 True,
-                [f"HL7 Validator 시간 초과({timeout_seconds}초): {exc}"],
+                [f"HL7 Validator 시간 초과({timeout_seconds}초)"],
                 [],
-                {"fatal": 0, "error": 1, "warning": 0, "information": 0},
+                {"fatal": 0, "error": 0, "warning": 0, "information": 0},
+                status="timeout",
             )
     output = "\n".join(part for part in (process.stdout, process.stderr) if part).strip()
     counts = _validator_issue_counts(output)
+    issues = []
+    for line in output.splitlines():
+        match = _VALIDATOR_SEVERITY.search(line)
+        if match and match.group(1).lower() in {"fatal", "error"}:
+            location = re.sub(r"^\s*\[\d+,\s*\d+\]\s*", "", line[:match.start()]).strip()
+            issues.append({"category": "validator", "severity": match.group(1).lower(),
+                           "path": location, "message": line[match.end():].strip()})
     retained_output = output[-max_output_chars:]
     errors: list[str] = []
     warnings: list[str] = []
@@ -172,7 +187,8 @@ def _run_external_validator(
         )
     elif output:
         warnings.append(retained_output)
-    return _ExternalValidatorResult(True, errors, warnings, counts)
+    status = "execution_failed" if process.returncode and not issues else "completed"
+    return _ExternalValidatorResult(True, errors, warnings, counts, issues, status)
 
 
 def validate_bundle_detailed(bundle: dict[str, Any], settings: Settings) -> ValidationReport:

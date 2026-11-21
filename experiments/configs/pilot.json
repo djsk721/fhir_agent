@@ -1,0 +1,95 @@
+{
+  "experiment_version": "1",
+  "prompt_version": "mapping-v1",
+  "development_dataset": "mimic_iv",
+  "external_dataset": "synthea",
+  "resources": ["Patient", "Encounter", "Condition", "Observation"],
+  "groups": ["B1", "P1", "P2"],
+  "model": {"base_url": "http://localhost:11434", "name": "gemma4:e4b", "temperature": 0, "seed": 42, "context_size": 16384, "max_output_tokens": 4096, "timeout_seconds": 300},
+  "prompts": {"mapping": "experiments/prompts/mapping_v1.txt", "direct": "experiments/prompts/direct_v1.txt"},
+  "rag": {"enabled": true, "embedding_model": "nomic-embed-text", "embedding_batch_size": 16, "top_k": 6},
+  "generation": {"sample_rows": 3, "batch_size": 2, "max_attempts": 2},
+  "logging": {"record_payloads": false},
+  "correction": {"max_iterations": 2, "gold_feedback": false},
+  "analysis": {"seed": 42, "resamples": 2000, "target_half_width": 0.05},
+  "source_checks": {
+    "mimic_iv": {
+      "Patient": [
+        {"id": "preserve-sex", "target_path": "gender", "operation": "lookup", "source_field": "gender", "table": {"M": "male", "F": "female"}, "fallback": "error"}
+      ],
+      "Encounter": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "subject_id"}
+      ],
+      "Condition": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "subject_id"},
+        {"id": "preserve-encounter-link", "target_path": "encounter", "operation": "reference", "resource_type": "Encounter", "source_field": "hadm_id"}
+      ],
+      "Observation": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "subject_id"},
+        {"id": "preserve-encounter-link", "target_path": "encounter", "operation": "reference", "resource_type": "Encounter", "source_field": "hadm_id"},
+        {"id": "preserve-lab-code", "target_path": "code.coding.0.code", "operation": "string", "source_field": "itemid"},
+        {"id": "preserve-numeric-value", "target_path": "valueQuantity.value", "operation": "decimal", "source_field": "valuenum", "when": {"field": "valuenum", "present": true}}
+      ]
+    },
+    "synthea": {
+      "Patient": [
+        {"id": "preserve-sex", "target_path": "gender", "operation": "lookup", "source_field": "gender", "table": {"M": "male", "F": "female"}, "fallback": "error"}
+      ],
+      "Encounter": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "patient"}
+      ],
+      "Condition": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "patient"},
+        {"id": "preserve-encounter-link", "target_path": "encounter", "operation": "reference", "resource_type": "Encounter", "source_field": "encounter"}
+      ],
+      "Observation": [
+        {"id": "preserve-subject-link", "target_path": "subject", "operation": "reference", "resource_type": "Patient", "source_field": "patient"},
+        {"id": "preserve-encounter-link", "target_path": "encounter", "operation": "reference", "resource_type": "Encounter", "source_field": "encounter"},
+        {"id": "preserve-code", "target_path": "code.coding.0.code", "operation": "string", "source_field": "code"},
+        {"id": "preserve-numeric-value", "target_path": "valueQuantity.value", "operation": "decimal", "source_field": "value", "when": {"field": "type", "equals": "numeric"}},
+        {"id": "preserve-text-value", "target_path": "valueString", "operation": "string", "source_field": "value", "when": {"field": "type", "equals": "text"}}
+      ]
+    }
+  },
+  "validation": {"schema_path": "db/fhir.schema.json", "validator_jar": "validator_cli.jar", "require_hl7": true, "timeout_seconds": 120},
+  "evaluation": {
+    "reference_by_dataset": {
+      "mimic_iv": {
+        "file_patterns": ["MimicPatient.ndjson.gz", "MimicEncounter.ndjson.gz", "MimicCondition.ndjson.gz", "MimicObservationLabevents.ndjson.gz"],
+        "identity_rules": {
+          "Patient": {"identifier_system": "http://mimic.mit.edu/fhir/mimic/identifier/patient"},
+          "Encounter": {"identifier_system": "http://mimic.mit.edu/fhir/mimic/identifier/encounter-hosp"}
+        }
+      }
+    },
+    "date_only_paths": {"Condition": ["onsetDateTime"]},
+    "projections_by_dataset": {
+      "synthea": {
+        "component_events": {
+          "Observation": {"path": "component", "inherit": ["subject", "encounter", "effectiveDateTime"]}
+        },
+        "copy_paths": {"Observation": {"valueString": "valueCodeableConcept.text"}}
+      }
+    },
+    "field_paths_by_dataset": {
+      "mimic_iv": {
+        "Patient": ["gender", "deceasedDateTime"],
+        "Encounter": ["subject", "period"],
+        "Condition": ["code.coding.0.code", "subject", "encounter"],
+        "Observation": ["code.coding.0.code", "subject", "encounter", "effectiveDateTime", "valueQuantity.value", "valueQuantity.unit", "valueString"]
+      },
+      "synthea": {
+        "Patient": ["gender", "birthDate", "deceasedDateTime"],
+        "Encounter": ["status", "class.code", "subject.reference", "period"],
+        "Condition": ["code.coding.0.code", "subject.reference", "encounter.reference", "onsetDateTime"],
+        "Observation": ["code.coding.0.code", "subject.reference", "encounter.reference", "effectiveDateTime", "valueQuantity.value", "valueQuantity.unit", "valueString"]
+      }
+    },
+    "field_paths": {
+      "Patient": ["gender", "birthDate", "deceasedDateTime"],
+      "Encounter": ["status", "class", "subject", "period"],
+      "Condition": ["code", "subject", "encounter", "onsetDateTime"],
+      "Observation": ["code", "subject", "encounter", "effectiveDateTime", "valueQuantity", "valueString"]
+    }
+  }
+}

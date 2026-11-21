@@ -1,0 +1,65 @@
+{
+  "dataset": "mimic_iv",
+  "dataset_version": "2.2",
+  "schema_version": "v1",
+  "extractor_version": "v1",
+  "resources": {
+    "Patient": {
+      "source_resource": "patients",
+      "schema": "mimiciv_hosp",
+      "table": "patients",
+      "columns": ["subject_id", "gender", "dod"],
+      "column_descriptions": {"subject_id": "Stable patient identifier", "gender": "Administrative sex code, M male or F female", "dod": "Date of death, not date of birth. Null when unavailable"},
+      "primary_keys": ["subject_id"],
+      "identity_fields": ["subject_id"],
+      "foreign_keys": [],
+      "patient_column": "subject_id"
+    },
+    "Encounter": {
+      "source_resource": "admissions",
+      "schema": "mimiciv_hosp",
+      "table": "admissions",
+      "table_description": "One recorded hospital inpatient admission. The admission_type column gives local admission type (e.g. route or urgency), not the standard FHIR encounter class.",
+      "columns": ["subject_id", "hadm_id", "admission_type", "admittime", "dischtime"],
+      "column_descriptions": {"subject_id": "Patient identifier", "hadm_id": "Hospital admission identifier", "admission_type": "Source hospital admission type", "admittime": "Admission timestamp", "dischtime": "Discharge timestamp"},
+      "primary_keys": ["hadm_id"],
+      "identity_fields": ["hadm_id"],
+      "foreign_keys": [
+        {
+          "columns": ["subject_id"],
+          "referred_table": "patients",
+          "referred_columns": ["subject_id"]
+        }
+      ],
+      "patient_column": "subject_id"
+    },
+    "Condition": {
+      "source_resource": "diagnoses_icd",
+      "schema": "mimiciv_hosp",
+      "table": "diagnoses_icd",
+      "columns": ["subject_id", "hadm_id", "seq_num", "icd_code", "icd_version"],
+      "column_descriptions": {"subject_id": "Patient identifier", "hadm_id": "Hospital admission identifier", "seq_num": "Diagnosis sequence within the admission", "icd_code": "Diagnosis code as stored", "icd_version": "ICD revision, 9 or 10"},
+      "primary_keys": ["hadm_id", "seq_num"],
+      "foreign_keys": [
+        {"columns": ["subject_id"], "referred_table": "patients", "referred_columns": ["subject_id"]},
+        {"columns": ["hadm_id"], "referred_table": "admissions", "referred_columns": ["hadm_id"]}
+      ],
+      "patient_column": "subject_id",
+      "encounter_column": "hadm_id"
+    },
+    "Observation": {
+      "source_resource": "labevents",
+      "schema": "mimiciv_hosp",
+      "table": "labevents",
+      "columns": ["labevent_id", "subject_id", "hadm_id", "itemid", "charttime", "valuenum", "value", "valueuom"],
+      "column_descriptions": {"labevent_id": "Unique laboratory event identifier", "subject_id": "Patient identifier", "hadm_id": "Hospital admission identifier, nullable", "itemid": "Local laboratory item code", "charttime": "Measurement timestamp", "valuenum": "Numeric result when available", "value": "Original result text, also populated for numeric results", "valueuom": "Original result unit"},
+      "primary_keys": ["labevent_id"],
+      "foreign_keys": [
+        {"columns": ["subject_id"], "referred_table": "patients", "referred_columns": ["subject_id"]},
+        {"columns": ["hadm_id"], "referred_table": "admissions", "referred_columns": ["hadm_id"]}
+      ],
+      "patient_column": "subject_id",
+      "encounter_column": "hadm_id"
+    }
+  }
+}

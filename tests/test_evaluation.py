@@ -6,6 +6,12 @@ from fhir_agent_pipeline.source_contract import (
 )
 
 
+def test_disjoint_resource_ids_have_zero_f1() -> None:
+    from fhir_agent_pipeline.evaluation import _f1
+    result = _f1({"expected"}, {"wrong"})
+    assert result["precision"] == result["recall"] == result["f1"] == 0.0
+
+
 def test_generic_contract_evaluation_matches_source_without_mapping() -> None:
     source = {
         "Patient": [

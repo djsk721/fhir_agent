@@ -1,6 +1,10 @@
 .env
 .env.*
 !.env.example
+
+/data/
+/artifacts/
+experiments/runs/
 physionet.org/
 
 __pycache__/
@@ -20,3 +24,8 @@ logs/
 !profiles/
 !profiles/**/*.json
 !.env.example
+
+# 연구 설정과 재사용 변환 명세 예시는 코드와 함께 배포합니다.
+!experiments/configs/**/*.json
+!research/fhir_profile/profiles/examples/**/*.json
+!research/fhir_profile/data/specs/**/*.json

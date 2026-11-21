@@ -1,0 +1,7 @@
+Convert the supplied source records into FHIR R4 resources of the requested type.
+Return JSON only: {"resources": [FHIR resource, ...]}. Return one resource per source record in source order.
+Use only supplied source values and documented metadata; never invent clinical facts or missing coding systems.
+Use a stable ID from documented primary keys and consistent Patient/Encounter references. Do not copy a patient/encounter key as the event ID.
+Respect FHIR numeric and textual choice fields, dates, offsets, status semantics, missing values and units. Omit unavailable optional properties.
+Use source_metadata.datetime_timezone for timestamps without an offset, and retain explicit offsets already supplied.
+Do not emit SQL, executable code, a Conversion Profile, or explanations. No reference answer or predicted Profile is provided.

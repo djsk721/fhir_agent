@@ -1,0 +1,97 @@
+{
+  "profile_id": "observation-labevents-v1",
+  "profile_version": "1.0.0",
+  "target_resource": "Observation",
+  "fhir_version": "4.0.1",
+  "source": {
+    "dataset": "mimic_iv",
+    "dataset_version": "2.2",
+    "schema_version": "v1",
+    "table": "labevents"
+  },
+  "identity": {
+    "source_fields": ["labevent_id"]
+  },
+  "mappings": [
+    {
+      "id": "status",
+      "target_path": "status",
+      "operation": "constant",
+      "value": "unknown",
+      "evidence": "The extracted source does not expose a result status; FHIR Observation.status unknown explicitly records that missing information."
+    },
+    {
+      "id": "code",
+      "target_path": "code",
+      "operation": "codeable_concept",
+      "system": {"operation": "constant", "value": "urn:source:item"},
+      "code": {"source_field": "itemid", "operation": "string"},
+      "display": {"source_field": "label", "operation": "string", "null_policy": "omit"}
+    },
+    {
+      "id": "subject",
+      "target_path": "subject",
+      "operation": "reference",
+      "source_field": "subject_id",
+      "resource_type": "Patient"
+    },
+    {
+      "id": "encounter",
+      "target_path": "encounter",
+      "operation": "reference",
+      "source_field": "hadm_id",
+      "resource_type": "Encounter",
+      "null_policy": "omit"
+    },
+    {
+      "id": "effective",
+      "target_path": "effectiveDateTime",
+      "source_field": "charttime",
+      "operation": "datetime",
+      "timezone": "Z",
+      "null_policy": "omit"
+    },
+    {
+      "id": "value",
+      "target_path": "valueQuantity.value",
+      "source_field": "valuenum",
+      "operation": "decimal",
+      "when": {"field": "valuenum", "present": true},
+      "null_policy": "omit"
+    },
+    {
+      "id": "text-value",
+      "target_path": "valueString",
+      "source_field": "value",
+      "operation": "copy",
+      "when": {"field": "valuenum", "present": false},
+      "null_policy": "omit"
+    },
+    {
+      "id": "unit",
+      "target_path": "valueQuantity.unit",
+      "source_field": "valueuom",
+      "operation": "string",
+      "when": {"field": "valuenum", "present": true},
+      "null_policy": "omit"
+    },
+    {
+      "id": "ucum-system",
+      "target_path": "valueQuantity.system",
+      "operation": "constant",
+      "value": "http://unitsofmeasure.org",
+      "when": {"all": [{"field": "valuenum", "present": true}, {"field": "valueuom", "in": ["mm Hg", "mg/dL"]}]},
+      "evidence": "Only the explicitly reviewed unit spellings in the corresponding UCUM lookup are declared UCUM."
+    },
+    {
+      "id": "ucum-code",
+      "target_path": "valueQuantity.code",
+      "source_field": "valueuom",
+      "operation": "lookup",
+      "table": {"mm Hg": "mm[Hg]", "mg/dL": "mg/dL"},
+      "fallback": "omit",
+      "when": {"field": "valuenum", "present": true},
+      "null_policy": "omit"
+    }
+  ]
+}
